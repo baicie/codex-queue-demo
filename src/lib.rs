@@ -10,7 +10,8 @@ mod worker;
 
 pub use codex::CodexCli;
 pub use worker::{
-    QueueRunner, RunSummary, TransientTaskError, WorkerError, WorkerOptions, run_queue_file,
+    QueueRunner, RunSummary, TransientTaskError, WorkerError, WorkerOptions, load_queue_file,
+    run_queue_file, save_queue_file,
 };
 
 #[derive(Debug, Error)]
@@ -179,7 +180,7 @@ pub fn build_execution_plan(queue: &Queue) -> Result<ExecutionPlan, QueueError> 
     })
 }
 
-fn validate_queue(queue: &Queue) -> Result<(), QueueError> {
+pub fn validate_queue(queue: &Queue) -> Result<(), QueueError> {
     if queue.version != 1 {
         return Err(QueueError::Validation("queue version must be 1".to_owned()));
     }

@@ -10,7 +10,10 @@ use fs2::FileExt;
 use tempfile::{Builder, NamedTempFile};
 use thiserror::Error;
 
-use crate::{Queue, QueueError, RetryPolicy, Task, TaskStatus, build_execution_plan, parse_queue};
+use crate::{
+    Queue, QueueError, RetryPolicy, Task, TaskStatus, build_execution_plan, parse_queue,
+    validate_queue,
+};
 
 #[derive(Debug, Error)]
 #[error("{message}")]
@@ -69,6 +72,24 @@ pub enum WorkerError {
     Launch(anyhow::Error),
     #[error("task {task_id} has reached the maximum attempt count")]
     AttemptOverflow { task_id: String },
+}
+
+pub fn load_queue_file(queue_path: &Path) -> Result<Queue, WorkerError> {
+    let queue_path = fs::canonicalize(queue_path).map_err(|source| WorkerError::ResolveQueue {
+        path: queue_path.to_path_buf(),
+        source,
+    })?;
+    let input = fs::read_to_string(&queue_path).map_err(|source| WorkerError::Read {
+        path: queue_path,
+        source,
+    })?;
+    Ok(parse_queue(&input)?)
+}
+
+pub fn save_queue_file(queue_path: &Path, queue: &Queue) -> Result<(), WorkerError> {
+    validate_queue(queue)?;
+    let _lock = QueueLock::acquire(queue_path)?;
+    write_queue(queue_path, queue)
 }
 
 pub fn run_queue_file(
