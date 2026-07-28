@@ -5,6 +5,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod worker;
+
+pub use worker::{QueueRunner, RunSummary, WorkerError, WorkerOptions, run_queue_file};
+
 #[derive(Debug, Error)]
 pub enum QueueError {
     #[error("invalid queue JSON: {0}")]
