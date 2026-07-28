@@ -25,6 +25,18 @@ fn rejects_unknown_dependencies() {
 }
 
 #[test]
+fn rejects_task_ids_that_are_unsafe_as_log_directory_names() {
+    let input = queue(vec![task("parent/child")]);
+
+    let error = parse_queue(&input.to_string()).expect_err("unsafe task ID must fail");
+
+    assert_eq!(
+        error.to_string(),
+        "task ID must be 1-64 ASCII letters, digits, '-' or '_': parent/child"
+    );
+}
+
+#[test]
 fn rejects_dependency_cycles() {
     let mut first = task("first");
     first["dependsOn"] = json!(["second"]);

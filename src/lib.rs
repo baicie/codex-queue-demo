@@ -162,7 +162,7 @@ fn validate_queue(queue: &Queue) -> Result<(), QueueError> {
 
     let mut tasks_by_id = HashMap::new();
     for task in &queue.tasks {
-        validate_non_empty(&task.id, "task id")?;
+        validate_task_id(&task.id)?;
         validate_non_empty(&task.title, &format!("task {} title", task.id))?;
         validate_non_empty(&task.workspace, &format!("task {} workspace", task.id))?;
         validate_non_empty(&task.prompt, &format!("task {} prompt", task.id))?;
@@ -187,6 +187,20 @@ fn validate_queue(queue: &Queue) -> Result<(), QueueError> {
     }
 
     assert_acyclic(&tasks_by_id)
+}
+
+fn validate_task_id(id: &str) -> Result<(), QueueError> {
+    let is_safe = !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+    if !is_safe {
+        return Err(QueueError::Validation(format!(
+            "task ID must be 1-64 ASCII letters, digits, '-' or '_': {id}"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_non_empty(value: &str, field: &str) -> Result<(), QueueError> {
