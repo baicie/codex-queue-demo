@@ -1,6 +1,6 @@
 # Codex Queue Demo
 
-A small Rust worker that opens Codex and then executes a dependency-aware JSON task queue. The same binary runs on macOS and Windows 11; only the operating-system scheduler registration differs.
+A small Rust worker that opens Codex and then executes a dependency-aware JSON task queue. The same source and CLI compile to native macOS and Windows 11 binaries; only the operating-system scheduler registration differs.
 
 ## Behavior
 
@@ -16,7 +16,7 @@ A small Rust worker that opens Codex and then executes a dependency-aware JSON t
 
 ## Build And Try
 
-Requirements: Rust 1.85 or newer and an authenticated Codex CLI available on `PATH`.
+Requirements: Rust 1.85 or newer and an authenticated Codex CLI available on `PATH`. Queues with `launchApp: true` also require Codex Desktop to be installed for the current user.
 
 ```bash
 cargo build --release
@@ -59,12 +59,13 @@ Windows 11 Task Scheduler, for the current logged-in user:
 .\scripts\install-windows.ps1 -QueuePath .\demo\queue.json
 ```
 
-The Windows task uses `Interactive` logon because `launchApp: true` needs a desktop session and the current user's Codex authentication. Both installers use local time, wake-when-supported settings, and non-overlapping execution.
+The Windows task uses `Interactive` logon because `launchApp: true` needs a desktop session and the current user's Codex authentication. Both installers use local time and prevent overlapping execution. Windows requests a wake timer when supported; a macOS LaunchAgent runs a missed calendar event after the Mac wakes.
 
 ## Limits Of This Demo
 
-- A powered-off machine cannot run at 01:00. Sleep wake-up depends on hardware and OS power settings; otherwise the job runs after the machine becomes available.
+- A powered-off machine cannot run at 01:00. Windows wake timers depend on hardware and power settings; macOS runs the missed job after the machine wakes.
 - macOS LaunchAgents require the user to be logged in. The Windows task is also interactive by design.
+- Windows Task Scheduler stops a run after four hours. An interrupted `running` task is recovered and retried at the next invocation.
 - Built-in Codex scheduled tasks cannot launch Codex after the app has been fully closed, so this demo uses the OS scheduler.
 - JSON plus a file lock is sufficient for this single-worker demo. A production multi-worker queue should use SQLite or a server database with leases and idempotency keys.
 - Reset task statuses to `pending` before rerunning the sample queue.
