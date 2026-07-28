@@ -5,8 +5,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod codex;
 mod worker;
 
+pub use codex::CodexCli;
 pub use worker::{QueueRunner, RunSummary, WorkerError, WorkerOptions, run_queue_file};
 
 #[derive(Debug, Error)]
