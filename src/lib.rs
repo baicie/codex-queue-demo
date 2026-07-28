@@ -84,13 +84,15 @@ pub enum TaskStatus {
     Blocked,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BlockedTask {
     pub task_id: String,
     pub reason: String,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ExecutionPlan {
     pub ordered_ids: Vec<String>,
     pub blocked: Vec<BlockedTask>,

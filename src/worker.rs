@@ -44,7 +44,8 @@ pub struct WorkerOptions {
     pub dry_run: bool,
 }
 
-#[derive(Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RunSummary {
     pub planned_ids: Vec<String>,
     pub succeeded_ids: Vec<String>,
