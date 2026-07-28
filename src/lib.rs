@@ -1,0 +1,239 @@
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum QueueError {
+    #[error("invalid queue JSON: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("{0}")]
+    Validation(String),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Queue {
+    pub version: u8,
+    pub launch_app: bool,
+    pub tasks: Vec<Task>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Task {
+    pub id: String,
+    pub title: String,
+    pub workspace: String,
+    pub prompt: String,
+    pub priority: i64,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    pub status: TaskStatus,
+    pub created_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempts: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskStatus {
+    Pending,
+    Running,
+    Succeeded,
+    Failed,
+    Blocked,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct BlockedTask {
+    pub task_id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct ExecutionPlan {
+    pub ordered_ids: Vec<String>,
+    pub blocked: Vec<BlockedTask>,
+}
+
+pub fn parse_queue(input: &str) -> Result<Queue, QueueError> {
+    let queue: Queue = serde_json::from_str(input)?;
+    validate_queue(&queue)?;
+    Ok(queue)
+}
+
+pub fn build_execution_plan(queue: &Queue) -> Result<ExecutionPlan, QueueError> {
+    validate_queue(queue)?;
+
+    let mut succeeded = HashSet::new();
+    let mut unavailable = HashSet::new();
+    let mut pending = HashMap::new();
+
+    for task in &queue.tasks {
+        match task.status {
+            TaskStatus::Succeeded => {
+                succeeded.insert(task.id.as_str());
+            }
+            TaskStatus::Failed | TaskStatus::Blocked => {
+                unavailable.insert(task.id.as_str());
+            }
+            TaskStatus::Pending | TaskStatus::Running => {
+                pending.insert(task.id.as_str(), task);
+            }
+        }
+    }
+
+    let mut blocked = Vec::new();
+    loop {
+        let mut newly_blocked = pending
+            .values()
+            .filter_map(|task| {
+                task.depends_on
+                    .iter()
+                    .find(|dependency| unavailable.contains(dependency.as_str()))
+                    .map(|dependency| (*task, dependency.as_str()))
+            })
+            .collect::<Vec<_>>();
+        newly_blocked.sort_by(|(left, _), (right, _)| compare_tasks(left, right));
+
+        if newly_blocked.is_empty() {
+            break;
+        }
+
+        for (task, dependency) in newly_blocked {
+            pending.remove(task.id.as_str());
+            unavailable.insert(task.id.as_str());
+            blocked.push(BlockedTask {
+                task_id: task.id.clone(),
+                reason: format!("dependency failed or is blocked: {dependency}"),
+            });
+        }
+    }
+
+    let mut ordered_ids = Vec::new();
+    while !pending.is_empty() {
+        let mut runnable = pending
+            .values()
+            .filter(|task| {
+                task.depends_on
+                    .iter()
+                    .all(|dependency| succeeded.contains(dependency.as_str()))
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        runnable.sort_by(|left, right| compare_tasks(left, right));
+
+        let Some(next) = runnable.first().copied() else {
+            return Err(QueueError::Validation(
+                "no runnable task found; queue contains an unresolved cycle".to_owned(),
+            ));
+        };
+
+        pending.remove(next.id.as_str());
+        succeeded.insert(next.id.as_str());
+        ordered_ids.push(next.id.clone());
+    }
+
+    Ok(ExecutionPlan {
+        ordered_ids,
+        blocked,
+    })
+}
+
+fn validate_queue(queue: &Queue) -> Result<(), QueueError> {
+    if queue.version != 1 {
+        return Err(QueueError::Validation("queue version must be 1".to_owned()));
+    }
+
+    let mut tasks_by_id = HashMap::new();
+    for task in &queue.tasks {
+        validate_non_empty(&task.id, "task id")?;
+        validate_non_empty(&task.title, &format!("task {} title", task.id))?;
+        validate_non_empty(&task.workspace, &format!("task {} workspace", task.id))?;
+        validate_non_empty(&task.prompt, &format!("task {} prompt", task.id))?;
+
+        if tasks_by_id.insert(task.id.as_str(), task).is_some() {
+            return Err(QueueError::Validation(format!(
+                "duplicate task ID: {}",
+                task.id
+            )));
+        }
+    }
+
+    for task in &queue.tasks {
+        for dependency in &task.depends_on {
+            if !tasks_by_id.contains_key(dependency.as_str()) {
+                return Err(QueueError::Validation(format!(
+                    "task {} depends on unknown task: {}",
+                    task.id, dependency
+                )));
+            }
+        }
+    }
+
+    assert_acyclic(&tasks_by_id)
+}
+
+fn validate_non_empty(value: &str, field: &str) -> Result<(), QueueError> {
+    if value.trim().is_empty() {
+        return Err(QueueError::Validation(format!(
+            "{field} must be a non-empty string"
+        )));
+    }
+    Ok(())
+}
+
+fn assert_acyclic(tasks_by_id: &HashMap<&str, &Task>) -> Result<(), QueueError> {
+    let mut visiting = HashSet::new();
+    let mut visited = HashSet::new();
+
+    fn visit<'a>(
+        id: &'a str,
+        tasks_by_id: &HashMap<&'a str, &'a Task>,
+        visiting: &mut HashSet<&'a str>,
+        visited: &mut HashSet<&'a str>,
+    ) -> Result<(), QueueError> {
+        if visiting.contains(id) {
+            return Err(QueueError::Validation(format!(
+                "task dependency cycle detected at: {id}"
+            )));
+        }
+        if visited.contains(id) {
+            return Ok(());
+        }
+
+        visiting.insert(id);
+        for dependency in &tasks_by_id
+            .get(id)
+            .expect("task IDs are validated before cycle detection")
+            .depends_on
+        {
+            visit(dependency.as_str(), tasks_by_id, visiting, visited)?;
+        }
+        visiting.remove(id);
+        visited.insert(id);
+        Ok(())
+    }
+
+    for id in tasks_by_id.keys() {
+        visit(id, tasks_by_id, &mut visiting, &mut visited)?;
+    }
+    Ok(())
+}
+
+fn compare_tasks(left: &Task, right: &Task) -> Ordering {
+    right
+        .priority
+        .cmp(&left.priority)
+        .then_with(|| left.created_at.cmp(&right.created_at))
+        .then_with(|| left.id.cmp(&right.id))
+}
