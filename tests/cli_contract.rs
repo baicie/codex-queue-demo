@@ -58,6 +58,43 @@ fn invalid_queue_returns_a_non_zero_exit_code() {
     );
 }
 
+#[test]
+fn dry_run_separates_blocked_tasks_from_the_executable_plan() {
+    let temp = TempDir::new().unwrap();
+    let queue_path = temp.path().join("queue.json");
+    let mut failed = task("failed", 0);
+    failed["status"] = json!("failed");
+    let mut child = task("child", 100);
+    child["dependsOn"] = json!(["failed"]);
+    fs::write(
+        &queue_path,
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "launchApp": false,
+                "tasks": [failed, child]
+            }))
+            .unwrap()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_codex-queue-demo"))
+        .arg("run")
+        .arg("--queue")
+        .arg(&queue_path)
+        .arg("--dry-run")
+        .output()
+        .expect("run demo CLI");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "Plan: (none)\nFailed: failed\nBlocked: child\n"
+    );
+}
+
 fn task(id: &str, priority: i64) -> serde_json::Value {
     json!({
         "id": id,

@@ -68,6 +68,8 @@ fn print_summary(summary: &RunSummary, dry_run: bool) {
     println!("Plan: {}", display_ids(&summary.planned_ids));
     if !dry_run {
         println!("Succeeded: {}", display_ids(&summary.succeeded_ids));
+    }
+    if !dry_run || !summary.failed_ids.is_empty() || !summary.blocked_ids.is_empty() {
         println!("Failed: {}", display_ids(&summary.failed_ids));
         println!("Blocked: {}", display_ids(&summary.blocked_ids));
     }

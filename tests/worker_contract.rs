@@ -119,6 +119,42 @@ fn launches_codex_once_with_the_first_planned_workspace() {
     );
 }
 
+#[test]
+fn reports_failures_and_blocks_that_were_already_persisted() {
+    let temp = TempDir::new().expect("temp directory");
+    let mut failed = task("failed");
+    failed["status"] = json!("failed");
+    let mut blocked = task("blocked");
+    blocked["status"] = json!("blocked");
+    let queue_path = write_queue(&temp, queue(false, vec![failed, blocked]));
+    let mut runner = FakeRunner::default();
+
+    let summary = run_queue_file(&queue_path, WorkerOptions::default(), &mut runner)
+        .expect("existing failures should be reported");
+
+    assert_eq!(summary.failed_ids, vec!["failed"]);
+    assert_eq!(summary.blocked_ids, vec!["blocked"]);
+    assert!(runner.executed.is_empty());
+}
+
+#[test]
+fn rejects_an_attempt_counter_that_cannot_be_incremented() {
+    let temp = TempDir::new().expect("temp directory");
+    let mut overflow = task("overflow");
+    overflow["attempts"] = json!(u32::MAX);
+    let queue_path = write_queue(&temp, queue(false, vec![overflow]));
+    let mut runner = FakeRunner::default();
+
+    let error = run_queue_file(&queue_path, WorkerOptions::default(), &mut runner)
+        .expect_err("attempt overflow must be reported without panicking");
+
+    assert_eq!(
+        error.to_string(),
+        "task overflow has reached the maximum attempt count"
+    );
+    assert!(runner.executed.is_empty());
+}
+
 fn write_queue(temp: &TempDir, value: Value) -> PathBuf {
     let path = temp.path().join("queue.json");
     fs::write(
