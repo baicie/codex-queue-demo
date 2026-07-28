@@ -25,7 +25,15 @@ fn passes_prompt_over_stdin_and_records_codex_outputs() {
         .expect("fake Codex execution succeeds");
 
     let arguments = fs::read_to_string(run_directory.join("args.txt")).unwrap();
-    assert!(arguments.lines().any(|argument| argument == "exec"));
+    assert_eq!(
+        arguments.lines().take(3).collect::<Vec<_>>(),
+        vec!["-a", "never", "exec"]
+    );
+    assert!(
+        !arguments
+            .lines()
+            .any(|argument| argument == "--ask-for-approval")
+    );
     assert!(
         arguments
             .lines()
@@ -50,6 +58,7 @@ fn passes_prompt_over_stdin_and_records_codex_outputs() {
 }
 
 #[test]
+#[cfg(not(target_os = "macos"))]
 fn opens_the_codex_app_for_the_requested_workspace() {
     let temp = TempDir::new().expect("temp directory");
     let fake_codex = compile_fake_codex(temp.path());

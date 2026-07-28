@@ -10,6 +10,7 @@ A small Rust worker that opens Codex and then executes a dependency-aware JSON t
 - Marks dependent tasks `blocked` when a dependency fails, while continuing independent work.
 - Persists `running`, `succeeded`, `failed`, and `blocked` states in the queue file.
 - Uses a file lock to prevent overlapping workers.
+- Opens the existing `com.openai.codex` app bundle on macOS instead of invoking the CLI installer path.
 - Sends prompts to `codex exec` over stdin and stores each attempt under `runs/`.
 - Uses `workspace-write` sandboxing and `never` approval mode for unattended runs.
 

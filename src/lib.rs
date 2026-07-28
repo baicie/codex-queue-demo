@@ -230,7 +230,9 @@ fn assert_acyclic(tasks_by_id: &HashMap<&str, &Task>) -> Result<(), QueueError> 
         Ok(())
     }
 
-    for id in tasks_by_id.keys() {
+    let mut task_ids = tasks_by_id.keys().copied().collect::<Vec<_>>();
+    task_ids.sort_unstable();
+    for id in task_ids {
         visit(id, tasks_by_id, &mut visiting, &mut visited)?;
     }
     Ok(())

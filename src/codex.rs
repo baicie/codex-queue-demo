@@ -36,14 +36,14 @@ impl Default for CodexCli {
 
 impl QueueRunner for CodexCli {
     fn launch_app(&mut self, workspace: &Path) -> Result<()> {
-        let status = Command::new(&self.binary)
-            .arg("app")
-            .arg(workspace)
+        let app_command = build_app_command(self.binary.clone(), workspace);
+        let status = Command::new(&app_command.program)
+            .args(&app_command.arguments)
             .status()
-            .with_context(|| format!("failed to start {:?}", self.binary))?;
+            .with_context(|| format!("failed to start {:?}", app_command.program))?;
 
         if !status.success() {
-            bail!("codex app exited with status {status}");
+            bail!("Codex app launcher exited with status {status}");
         }
         Ok(())
     }
@@ -51,12 +51,12 @@ impl QueueRunner for CodexCli {
     fn execute_task(&mut self, task: &Task, workspace: &Path, run_directory: &Path) -> Result<()> {
         let final_output = run_directory.join("final.txt");
         let mut child = Command::new(&self.binary)
+            .arg("-a")
+            .arg("never")
             .arg("exec")
             .arg("--json")
             .arg("--ephemeral")
             .arg("--skip-git-repo-check")
-            .arg("--ask-for-approval")
-            .arg("never")
             .arg("--sandbox")
             .arg("workspace-write")
             .arg("-C")
@@ -96,5 +96,53 @@ impl QueueRunner for CodexCli {
             );
         }
         Ok(())
+    }
+}
+
+struct AppCommand {
+    program: OsString,
+    arguments: Vec<OsString>,
+}
+
+#[cfg(target_os = "macos")]
+fn build_app_command(_codex_binary: OsString, workspace: &Path) -> AppCommand {
+    AppCommand {
+        program: OsString::from("/usr/bin/open"),
+        arguments: vec![
+            OsString::from("-b"),
+            OsString::from("com.openai.codex"),
+            workspace.as_os_str().to_owned(),
+        ],
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn build_app_command(codex_binary: OsString, workspace: &Path) -> AppCommand {
+    AppCommand {
+        program: codex_binary,
+        arguments: vec![OsString::from("app"), workspace.as_os_str().to_owned()],
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    use super::build_app_command;
+
+    #[test]
+    fn launches_the_existing_codex_bundle_on_macos() {
+        let command = build_app_command(OsString::from("codex"), Path::new("/tmp/project"));
+
+        assert_eq!(command.program, OsString::from("/usr/bin/open"));
+        assert_eq!(
+            command.arguments,
+            vec![
+                OsString::from("-b"),
+                OsString::from("com.openai.codex"),
+                OsString::from("/tmp/project")
+            ]
+        );
     }
 }
