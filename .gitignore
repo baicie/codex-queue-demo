@@ -1,0 +1,6 @@
+node_modules/
+dist/
+runs/
+*.lock
+.env
+.DS_Store
