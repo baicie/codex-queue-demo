@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "launchApp": true,
+  "tasks": [
+    {
+      "id": "dependent-finish",
+      "title": "Dependency ordering check",
+      "workspace": "..",
+      "prompt": "Do not modify files. Reply with exactly QUEUE_DEMO_DEPENDENCY_OK.",
+      "priority": 100,
+      "dependsOn": [
+        "environment-check"
+      ],
+      "status": "pending",
+      "createdAt": "2026-07-28T00:00:02Z"
+    },
+    {
+      "id": "independent-priority",
+      "title": "Priority ordering check",
+      "workspace": "..",
+      "prompt": "Do not modify files. Reply with exactly QUEUE_DEMO_PRIORITY_OK.",
+      "priority": 50,
+      "dependsOn": [],
+      "status": "pending",
+      "createdAt": "2026-07-28T00:00:01Z"
+    },
+    {
+      "id": "environment-check",
+      "title": "Codex execution check",
+      "workspace": "..",
+      "prompt": "Do not modify files. Reply with exactly QUEUE_DEMO_ENV_OK.",
+      "priority": 10,
+      "dependsOn": [],
+      "status": "pending",
+      "createdAt": "2026-07-28T00:00:00Z"
+    }
+  ]
+}
