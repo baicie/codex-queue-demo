@@ -40,7 +40,7 @@ exit `$LASTEXITCODE
 
 if ($PSCmdlet.ShouldProcess($TaskName, 'Install daily 01:00 Codex queue task')) {
     New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
-    Set-Content -LiteralPath $runnerPath -Value $runner -Encoding UTF8
+    Set-Content -LiteralPath $runnerPath -Value $runner -Encoding Unicode
 
     $powershell = (Get-Command powershell.exe -CommandType Application).Source
     $actionArguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}"' -f $runnerPath

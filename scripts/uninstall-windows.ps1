@@ -6,6 +6,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 if ($PSCmdlet.ShouldProcess($TaskName, 'Uninstall Codex queue task')) {
+    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
     Write-Host "Uninstalled $TaskName. Existing logs and queue results were preserved."
 }
