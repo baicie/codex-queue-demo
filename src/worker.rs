@@ -1,19 +1,39 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{Duration as ChronoDuration, Utc};
 use fs2::FileExt;
 use tempfile::{Builder, NamedTempFile};
 use thiserror::Error;
 
-use crate::{Queue, QueueError, Task, TaskStatus, build_execution_plan, parse_queue};
+use crate::{Queue, QueueError, RetryPolicy, Task, TaskStatus, build_execution_plan, parse_queue};
+
+#[derive(Debug, Error)]
+#[error("{message}")]
+pub struct TransientTaskError {
+    message: String,
+}
+
+impl TransientTaskError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
 
 pub trait QueueRunner {
     fn launch_app(&mut self, workspace: &Path) -> Result<()>;
 
     fn execute_task(&mut self, task: &Task, workspace: &Path, run_directory: &Path) -> Result<()>;
+
+    fn wait_before_retry(&mut self, delay: Duration) {
+        thread::sleep(delay);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -67,7 +87,7 @@ pub fn run_queue_file(
         source,
     })?;
     let mut queue = parse_queue(&input)?;
-
+    let retry_state_changed = normalize_retry_state(&mut queue)?;
     let initial_plan = build_execution_plan(&queue)?;
     let mut summary = RunSummary {
         planned_ids: initial_plan.ordered_ids.clone(),
@@ -98,16 +118,12 @@ pub fn run_queue_file(
         return Ok(summary);
     }
 
-    for task in &mut queue.tasks {
-        if task.status == TaskStatus::Running {
-            task.status = TaskStatus::Pending;
-            task.last_error = Some("recovered from an interrupted worker run".to_owned());
-        }
+    if retry_state_changed {
+        write_queue(&queue_path, &queue)?;
     }
 
-    let recovered_plan = build_execution_plan(&queue)?;
     if queue.launch_app {
-        let first_task = recovered_plan
+        let first_task = initial_plan
             .ordered_ids
             .first()
             .and_then(|first_id| queue.tasks.iter().find(|task| &task.id == first_id));
@@ -121,11 +137,12 @@ pub fn run_queue_file(
         let plan = build_execution_plan(&queue)?;
         let mut queue_changed = false;
 
-        for blocked in plan.blocked {
+        for blocked in &plan.blocked {
             if let Some(task) = task_mut(&mut queue, &blocked.task_id) {
                 task.status = TaskStatus::Blocked;
                 task.finished_at = Some(Utc::now());
-                task.last_error = Some(blocked.reason);
+                task.last_error = Some(blocked.reason.clone());
+                task.next_retry_at = None;
                 summary.blocked_ids.push(task.id.clone());
                 queue_changed = true;
             }
@@ -135,12 +152,22 @@ pub fn run_queue_file(
             write_queue(&queue_path, &queue)?;
         }
 
-        let Some(next_id) = plan.ordered_ids.first() else {
-            break;
+        let now = Utc::now();
+        let next_id = plan
+            .ordered_ids
+            .iter()
+            .find(|task_id| task_is_ready(&queue, task_id, now))
+            .cloned();
+        let Some(next_id) = next_id else {
+            let Some((task_id, retry_at)) = next_scheduled_retry(&queue, &plan, now) else {
+                break;
+            };
+            wait_for_scheduled_retry(&queue_path, &mut queue, &task_id, retry_at, runner)?;
+            continue;
         };
 
         let started_at = Utc::now();
-        let task = task_mut(&mut queue, next_id).expect("planned task must exist");
+        let task = task_mut(&mut queue, &next_id).expect("planned task must exist");
         task.status = TaskStatus::Running;
         task.attempts = Some(task.attempts.unwrap_or(0).checked_add(1).ok_or_else(|| {
             WorkerError::AttemptOverflow {
@@ -150,6 +177,7 @@ pub fn run_queue_file(
         task.started_at = Some(started_at);
         task.finished_at = None;
         task.last_error = None;
+        task.next_retry_at = None;
         let task_snapshot = task.clone();
         write_queue(&queue_path, &queue)?;
 
@@ -162,23 +190,174 @@ pub fn run_queue_file(
             });
 
         let finished_at = Utc::now();
-        let task = task_mut(&mut queue, next_id).expect("running task must exist");
-        task.finished_at = Some(finished_at);
+        let retry_policy = queue.retry_policy;
+        let task = task_mut(&mut queue, &next_id).expect("running task must exist");
         match result {
             Ok(()) => {
                 task.status = TaskStatus::Succeeded;
+                task.finished_at = Some(finished_at);
+                task.next_retry_at = None;
                 summary.succeeded_ids.push(task.id.clone());
             }
             Err(error) => {
-                task.status = TaskStatus::Failed;
-                task.last_error = Some(format!("{error:#}"));
-                summary.failed_ids.push(task.id.clone());
+                let attempts = task.attempts.unwrap_or(1);
+                if is_transient_error(&error) && attempts < retry_policy.max_attempts {
+                    let delay = retry_delay(retry_policy, attempts);
+                    let chrono_delay = ChronoDuration::from_std(delay)
+                        .expect("validated retry delay must fit chrono duration");
+                    task.status = TaskStatus::Pending;
+                    task.finished_at = None;
+                    task.last_error = Some(format!("{error:#}"));
+                    task.next_retry_at = Some(finished_at + chrono_delay);
+                } else {
+                    task.status = TaskStatus::Failed;
+                    task.finished_at = Some(finished_at);
+                    task.last_error = Some(format!("{error:#}"));
+                    task.next_retry_at = None;
+                    summary.failed_ids.push(task.id.clone());
+                }
             }
         }
         write_queue(&queue_path, &queue)?;
     }
 
     Ok(summary)
+}
+
+fn normalize_retry_state(queue: &mut Queue) -> Result<bool, WorkerError> {
+    let now = Utc::now();
+    let mut changed = false;
+
+    for task in &mut queue.tasks {
+        if matches!(task.status, TaskStatus::Pending | TaskStatus::Running)
+            && task.attempts == Some(u32::MAX)
+        {
+            return Err(WorkerError::AttemptOverflow {
+                task_id: task.id.clone(),
+            });
+        }
+
+        let attempts_exhausted = task
+            .attempts
+            .is_some_and(|attempts| attempts >= queue.retry_policy.max_attempts);
+        match task.status {
+            TaskStatus::Running if attempts_exhausted => {
+                task.status = TaskStatus::Failed;
+                task.finished_at = Some(now);
+                task.next_retry_at = None;
+                task.last_error = Some(format!(
+                    "interrupted worker run reached the maximum attempt count ({})",
+                    queue.retry_policy.max_attempts
+                ));
+                changed = true;
+            }
+            TaskStatus::Running => {
+                task.status = TaskStatus::Pending;
+                task.next_retry_at = None;
+                task.last_error
+                    .get_or_insert_with(|| "recovered from an interrupted worker run".to_owned());
+                changed = true;
+            }
+            TaskStatus::Pending if attempts_exhausted => {
+                task.status = TaskStatus::Failed;
+                task.finished_at = Some(now);
+                task.next_retry_at = None;
+                task.last_error = Some(format!(
+                    "maximum attempt count ({}) reached before execution",
+                    queue.retry_policy.max_attempts
+                ));
+                changed = true;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(changed)
+}
+
+fn task_is_ready(queue: &Queue, task_id: &str, now: chrono::DateTime<Utc>) -> bool {
+    let Some(task) = queue.tasks.iter().find(|task| task.id == task_id) else {
+        return false;
+    };
+    task.status == TaskStatus::Pending
+        && task.next_retry_at.is_none_or(|retry_at| retry_at <= now)
+        && task.depends_on.iter().all(|dependency| {
+            queue
+                .tasks
+                .iter()
+                .find(|task| task.id == *dependency)
+                .is_some_and(|task| task.status == TaskStatus::Succeeded)
+        })
+}
+
+fn next_scheduled_retry(
+    queue: &Queue,
+    plan: &crate::ExecutionPlan,
+    now: chrono::DateTime<Utc>,
+) -> Option<(String, chrono::DateTime<Utc>)> {
+    plan.ordered_ids
+        .iter()
+        .filter_map(|task_id| {
+            let task = queue.tasks.iter().find(|task| task.id == *task_id)?;
+            let retry_at = task.next_retry_at?;
+            (task.status == TaskStatus::Pending
+                && retry_at > now
+                && task.depends_on.iter().all(|dependency| {
+                    queue
+                        .tasks
+                        .iter()
+                        .find(|task| task.id == *dependency)
+                        .is_some_and(|task| task.status == TaskStatus::Succeeded)
+                }))
+            .then_some((task.id.clone(), retry_at))
+        })
+        .min_by_key(|(_, retry_at)| *retry_at)
+}
+
+fn wait_for_scheduled_retry(
+    queue_path: &Path,
+    queue: &mut Queue,
+    task_id: &str,
+    retry_at: chrono::DateTime<Utc>,
+    runner: &mut impl QueueRunner,
+) -> Result<(), WorkerError> {
+    let remaining_delay = retry_at
+        .signed_duration_since(Utc::now())
+        .to_std()
+        .ok()
+        .filter(|delay| !delay.is_zero())
+        .map(|delay| delay.min(Duration::from_secs(queue.retry_policy.max_delay_seconds)))
+        .map(round_up_to_second);
+    if let Some(delay) = remaining_delay {
+        runner.wait_before_retry(delay);
+    }
+
+    let task = task_mut(queue, task_id).expect("scheduled retry task must exist");
+    task.next_retry_at = None;
+    write_queue(queue_path, queue)
+}
+
+fn round_up_to_second(delay: Duration) -> Duration {
+    if delay.subsec_nanos() == 0 {
+        delay
+    } else {
+        Duration::from_secs(delay.as_secs().saturating_add(1))
+    }
+}
+
+fn is_transient_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<TransientTaskError>().is_some()
+}
+
+fn retry_delay(policy: RetryPolicy, completed_attempts: u32) -> Duration {
+    let exponent = completed_attempts.saturating_sub(1).min(19);
+    let multiplier = 1_u64 << exponent;
+    Duration::from_secs(
+        policy
+            .initial_delay_seconds
+            .saturating_mul(multiplier)
+            .min(policy.max_delay_seconds),
+    )
 }
 
 fn task_mut<'a>(queue: &'a mut Queue, id: &str) -> Option<&'a mut Task> {

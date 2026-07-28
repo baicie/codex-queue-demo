@@ -1,6 +1,11 @@
 {
   "version": 1,
   "launchApp": true,
+  "retryPolicy": {
+    "maxAttempts": 4,
+    "initialDelaySeconds": 30,
+    "maxDelaySeconds": 900
+  },
   "tasks": [
     {
       "id": "dependent-finish",

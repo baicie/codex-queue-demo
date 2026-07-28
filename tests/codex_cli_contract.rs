@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use chrono::Utc;
-use codex_queue_demo::{CodexCli, QueueRunner, Task, TaskStatus};
+use codex_queue_demo::{CodexCli, QueueRunner, Task, TaskStatus, TransientTaskError};
 use tempfile::TempDir;
 
 #[test]
@@ -58,6 +58,29 @@ fn passes_prompt_over_stdin_and_records_codex_outputs() {
 }
 
 #[test]
+fn distinguishes_transient_api_failures_from_authentication_failures() {
+    let temp = TempDir::new().expect("temp directory");
+    let fake_codex = compile_fake_codex(temp.path());
+    let workspace = temp.path().join("workspace");
+    let transient_run = temp.path().join("transient-run");
+    let permanent_run = temp.path().join("permanent-run");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&transient_run).unwrap();
+    fs::create_dir_all(&permanent_run).unwrap();
+    let mut codex = CodexCli::new(fake_codex);
+
+    let transient = codex
+        .execute_task(&task("TRANSIENT_API_FAILURE"), &workspace, &transient_run)
+        .expect_err("503 should fail");
+    let permanent = codex
+        .execute_task(&task("PERMANENT_API_FAILURE"), &workspace, &permanent_run)
+        .expect_err("401 should fail");
+
+    assert!(transient.downcast_ref::<TransientTaskError>().is_some());
+    assert!(permanent.downcast_ref::<TransientTaskError>().is_none());
+}
+
+#[test]
 #[cfg(not(target_os = "macos"))]
 fn opens_the_codex_app_for_the_requested_workspace() {
     let temp = TempDir::new().expect("temp directory");
@@ -90,6 +113,7 @@ fn task(prompt: &str) -> Task {
         started_at: None,
         finished_at: None,
         last_error: None,
+        next_retry_at: None,
     }
 }
 
@@ -118,7 +142,15 @@ fn main() {
     let mut prompt = String::new();
     io::stdin().read_to_string(&mut prompt).unwrap();
     fs::write(run_directory.join("args.txt"), format!("{}\n", args.join("\n"))).unwrap();
-    fs::write(run_directory.join("prompt.txt"), prompt).unwrap();
+    fs::write(run_directory.join("prompt.txt"), &prompt).unwrap();
+    if prompt.contains("TRANSIENT_API_FAILURE") {
+        eprintln!("HTTP 503 service unavailable");
+        std::process::exit(1);
+    }
+    if prompt.contains("PERMANENT_API_FAILURE") {
+        eprintln!("HTTP 401 invalid authentication");
+        std::process::exit(1);
+    }
     fs::write(final_path, "FAKE_CODEX_OK\n").unwrap();
     println!("{{\"type\":\"completed\"}}");
 }

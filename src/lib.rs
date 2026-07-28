@@ -9,7 +9,9 @@ mod codex;
 mod worker;
 
 pub use codex::CodexCli;
-pub use worker::{QueueRunner, RunSummary, WorkerError, WorkerOptions, run_queue_file};
+pub use worker::{
+    QueueRunner, RunSummary, TransientTaskError, WorkerError, WorkerOptions, run_queue_file,
+};
 
 #[derive(Debug, Error)]
 pub enum QueueError {
@@ -24,7 +26,27 @@ pub enum QueueError {
 pub struct Queue {
     pub version: u8,
     pub launch_app: bool,
+    #[serde(default)]
+    pub retry_policy: RetryPolicy,
     pub tasks: Vec<Task>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields, default)]
+pub struct RetryPolicy {
+    pub max_attempts: u32,
+    pub initial_delay_seconds: u64,
+    pub max_delay_seconds: u64,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 4,
+            initial_delay_seconds: 30,
+            max_delay_seconds: 900,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -47,6 +69,8 @@ pub struct Task {
     pub finished_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_retry_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -159,6 +183,7 @@ fn validate_queue(queue: &Queue) -> Result<(), QueueError> {
     if queue.version != 1 {
         return Err(QueueError::Validation("queue version must be 1".to_owned()));
     }
+    validate_retry_policy(queue.retry_policy)?;
 
     let mut tasks_by_id = HashMap::new();
     for task in &queue.tasks {
@@ -187,6 +212,30 @@ fn validate_queue(queue: &Queue) -> Result<(), QueueError> {
     }
 
     assert_acyclic(&tasks_by_id)
+}
+
+fn validate_retry_policy(policy: RetryPolicy) -> Result<(), QueueError> {
+    if !(1..=20).contains(&policy.max_attempts) {
+        return Err(QueueError::Validation(
+            "retryPolicy.maxAttempts must be between 1 and 20".to_owned(),
+        ));
+    }
+    if policy.initial_delay_seconds == 0 {
+        return Err(QueueError::Validation(
+            "retryPolicy.initialDelaySeconds must be greater than 0".to_owned(),
+        ));
+    }
+    if policy.max_delay_seconds < policy.initial_delay_seconds {
+        return Err(QueueError::Validation(
+            "retryPolicy.maxDelaySeconds must be at least initialDelaySeconds".to_owned(),
+        ));
+    }
+    if policy.max_delay_seconds > 86_400 {
+        return Err(QueueError::Validation(
+            "retryPolicy.maxDelaySeconds must not exceed 86400".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_task_id(id: &str) -> Result<(), QueueError> {

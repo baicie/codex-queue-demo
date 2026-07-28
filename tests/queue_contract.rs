@@ -25,6 +25,83 @@ fn rejects_unknown_dependencies() {
 }
 
 #[test]
+fn applies_safe_retry_defaults_to_existing_queue_files() {
+    let queue = parse_queue(&queue(vec![task("existing")]).to_string()).expect("valid queue");
+
+    assert_eq!(queue.retry_policy.max_attempts, 4);
+    assert_eq!(queue.retry_policy.initial_delay_seconds, 30);
+    assert_eq!(queue.retry_policy.max_delay_seconds, 900);
+}
+
+#[test]
+fn rejects_an_unbounded_retry_policy() {
+    let mut input = queue(vec![task("retry")]);
+    input["retryPolicy"] = json!({
+        "maxAttempts": 0,
+        "initialDelaySeconds": 30,
+        "maxDelaySeconds": 900
+    });
+
+    let error = parse_queue(&input.to_string()).expect_err("zero attempts must fail");
+
+    assert_eq!(
+        error.to_string(),
+        "retryPolicy.maxAttempts must be between 1 and 20"
+    );
+}
+
+#[test]
+fn rejects_retry_delays_longer_than_one_day() {
+    let mut input = queue(vec![task("retry")]);
+    input["retryPolicy"] = json!({
+        "maxAttempts": 4,
+        "initialDelaySeconds": 30,
+        "maxDelaySeconds": 86401
+    });
+
+    let error = parse_queue(&input.to_string()).expect_err("unbounded delay must fail");
+
+    assert_eq!(
+        error.to_string(),
+        "retryPolicy.maxDelaySeconds must not exceed 86400"
+    );
+}
+
+#[test]
+fn rejects_a_zero_initial_retry_delay() {
+    let mut input = queue(vec![task("retry")]);
+    input["retryPolicy"] = json!({
+        "maxAttempts": 4,
+        "initialDelaySeconds": 0,
+        "maxDelaySeconds": 900
+    });
+
+    let error = parse_queue(&input.to_string()).expect_err("zero delay must fail");
+
+    assert_eq!(
+        error.to_string(),
+        "retryPolicy.initialDelaySeconds must be greater than 0"
+    );
+}
+
+#[test]
+fn rejects_a_retry_cap_below_the_initial_delay() {
+    let mut input = queue(vec![task("retry")]);
+    input["retryPolicy"] = json!({
+        "maxAttempts": 4,
+        "initialDelaySeconds": 30,
+        "maxDelaySeconds": 29
+    });
+
+    let error = parse_queue(&input.to_string()).expect_err("invalid retry cap must fail");
+
+    assert_eq!(
+        error.to_string(),
+        "retryPolicy.maxDelaySeconds must be at least initialDelaySeconds"
+    );
+}
+
+#[test]
 fn rejects_task_ids_that_are_unsafe_as_log_directory_names() {
     let input = queue(vec![task("parent/child")]);
 
