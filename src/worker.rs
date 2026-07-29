@@ -7,12 +7,13 @@ use std::time::Duration;
 use anyhow::Result;
 use chrono::{Duration as ChronoDuration, Utc};
 use fs2::FileExt;
+use sha2::{Digest, Sha256};
 use tempfile::{Builder, NamedTempFile};
 use thiserror::Error;
 
 use crate::{
-    Queue, QueueError, RetryPolicy, Task, TaskStatus, build_execution_plan, parse_queue,
-    validate_queue,
+    BlockedReason, Queue, QueueError, RetryPolicy, Task, TaskStatus, build_execution_plan,
+    parse_queue, validate_queue,
 };
 
 #[derive(Debug, Error)]
@@ -44,6 +45,12 @@ pub struct WorkerOptions {
     pub dry_run: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct QueueFileSnapshot {
+    pub queue: Queue,
+    pub revision: String,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunSummary {
@@ -65,6 +72,12 @@ pub enum WorkerError {
     AlreadyRunning(PathBuf),
     #[error("cannot lock {path}: {source}")]
     Lock { path: PathBuf, source: io::Error },
+    #[error("queue changed since it was loaded: {path}; reload before saving")]
+    RevisionConflict {
+        path: PathBuf,
+        expected_revision: String,
+        actual_revision: String,
+    },
     #[error(transparent)]
     Queue(#[from] QueueError),
     #[error("cannot serialize queue: {0}")]
@@ -76,6 +89,10 @@ pub enum WorkerError {
 }
 
 pub fn load_queue_file(queue_path: &Path) -> Result<Queue, WorkerError> {
+    Ok(load_queue_file_with_revision(queue_path)?.queue)
+}
+
+pub fn load_queue_file_with_revision(queue_path: &Path) -> Result<QueueFileSnapshot, WorkerError> {
     let queue_path = fs::canonicalize(queue_path).map_err(|source| WorkerError::ResolveQueue {
         path: queue_path.to_path_buf(),
         source,
@@ -84,13 +101,58 @@ pub fn load_queue_file(queue_path: &Path) -> Result<Queue, WorkerError> {
         path: queue_path,
         source,
     })?;
-    Ok(parse_queue(&input)?)
+    Ok(QueueFileSnapshot {
+        queue: parse_queue(&input)?,
+        revision: queue_revision(input.as_bytes()),
+    })
+}
+
+pub fn create_queue_file_if_missing(queue_path: &Path, queue: &Queue) -> Result<bool, WorkerError> {
+    validate_queue(queue)?;
+    let _lock = QueueLock::acquire(queue_path)?;
+    let output = serialize_queue(queue)?;
+    atomic_create(queue_path, |file| file.write_all(&output)).map_err(|source| WorkerError::Write {
+        path: queue_path.to_path_buf(),
+        source,
+    })
 }
 
 pub fn save_queue_file(queue_path: &Path, queue: &Queue) -> Result<(), WorkerError> {
     validate_queue(queue)?;
     let _lock = QueueLock::acquire(queue_path)?;
     write_queue(queue_path, queue)
+}
+
+pub fn save_queue_file_if_revision(
+    queue_path: &Path,
+    queue: &Queue,
+    expected_revision: &str,
+) -> Result<QueueFileSnapshot, WorkerError> {
+    validate_queue(queue)?;
+    let queue_path = fs::canonicalize(queue_path).map_err(|source| WorkerError::ResolveQueue {
+        path: queue_path.to_path_buf(),
+        source,
+    })?;
+    let _lock = QueueLock::acquire(&queue_path)?;
+    let input = fs::read(&queue_path).map_err(|source| WorkerError::Read {
+        path: queue_path.clone(),
+        source,
+    })?;
+    let actual_revision = queue_revision(&input);
+    if actual_revision != expected_revision {
+        return Err(WorkerError::RevisionConflict {
+            path: queue_path,
+            expected_revision: expected_revision.to_owned(),
+            actual_revision,
+        });
+    }
+
+    let output = serialize_queue(queue)?;
+    write_queue_bytes(&queue_path, &output)?;
+    Ok(QueueFileSnapshot {
+        queue: queue.clone(),
+        revision: queue_revision(&output),
+    })
 }
 
 pub fn run_queue_file(
@@ -163,7 +225,11 @@ pub fn run_queue_file(
             if let Some(task) = task_mut(&mut queue, &blocked.task_id) {
                 task.status = TaskStatus::Blocked;
                 task.finished_at = Some(Utc::now());
-                task.last_error = Some(blocked.reason.clone());
+                task.last_error = None;
+                task.blocked_reason = Some(BlockedReason {
+                    reason_code: blocked.reason_code,
+                    dependency_id: blocked.dependency_id.clone(),
+                });
                 task.next_retry_at = None;
                 summary.blocked_ids.push(task.id.clone());
                 queue_changed = true;
@@ -199,6 +265,7 @@ pub fn run_queue_file(
         task.started_at = Some(started_at);
         task.finished_at = None;
         task.last_error = None;
+        task.blocked_reason = None;
         task.next_retry_at = None;
         let task_snapshot = task.clone();
         write_queue(&queue_path, &queue)?;
@@ -428,14 +495,25 @@ fn create_run_directory(
 }
 
 fn write_queue(path: &Path, queue: &Queue) -> Result<(), WorkerError> {
+    let output = serialize_queue(queue)?;
+    write_queue_bytes(path, &output)
+}
+
+fn serialize_queue(queue: &Queue) -> Result<Vec<u8>, WorkerError> {
     let mut output = serde_json::to_string_pretty(queue)?;
     output.push('\n');
-    atomic_replace(path, |file| file.write_all(output.as_bytes())).map_err(|source| {
-        WorkerError::Write {
-            path: path.to_path_buf(),
-            source,
-        }
+    Ok(output.into_bytes())
+}
+
+fn write_queue_bytes(path: &Path, output: &[u8]) -> Result<(), WorkerError> {
+    atomic_replace(path, |file| file.write_all(output)).map_err(|source| WorkerError::Write {
+        path: path.to_path_buf(),
+        source,
     })
+}
+
+fn queue_revision(input: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(input))
 }
 
 fn atomic_replace(path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) -> io::Result<()> {
@@ -449,6 +527,23 @@ fn atomic_replace(path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) 
     File::open(parent)?.sync_all()?;
 
     Ok(())
+}
+
+fn atomic_create(path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) -> io::Result<bool> {
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let mut temporary = NamedTempFile::new_in(parent)?;
+    write(temporary.as_file_mut())?;
+    temporary.as_file().sync_all()?;
+
+    match temporary.persist_noclobber(path) {
+        Ok(_) => {
+            #[cfg(unix)]
+            File::open(parent)?.sync_all()?;
+            Ok(true)
+        }
+        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error.error),
+    }
 }
 
 struct QueueLock {
@@ -500,7 +595,22 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use tempfile::TempDir;
 
-    use super::{atomic_replace, create_run_directory};
+    use super::{atomic_create, atomic_replace, create_run_directory};
+
+    #[test]
+    fn atomic_create_preserves_a_concurrently_created_queue() {
+        let temp = TempDir::new().expect("temp directory");
+        let path = temp.path().join("queue.json");
+
+        let created = atomic_create(&path, |temporary| {
+            temporary.write_all(b"default queue\n")?;
+            fs::write(&path, "concurrent queue\n")
+        })
+        .expect("an existing target is not an I/O failure");
+
+        assert!(!created);
+        assert_eq!(fs::read_to_string(path).unwrap(), "concurrent queue\n");
+    }
 
     #[test]
     fn failed_atomic_write_preserves_the_previous_queue() {

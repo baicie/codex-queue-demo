@@ -2,7 +2,7 @@
 name = "codex-queue-desktop"
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Tauri desktop interface for Codex Queue"
 license = "MIT"
 

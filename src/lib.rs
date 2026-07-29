@@ -10,8 +10,9 @@ mod worker;
 
 pub use codex::CodexCli;
 pub use worker::{
-    QueueRunner, RunSummary, TransientTaskError, WorkerError, WorkerOptions, load_queue_file,
-    run_queue_file, save_queue_file,
+    QueueFileSnapshot, QueueRunner, RunSummary, TransientTaskError, WorkerError, WorkerOptions,
+    create_queue_file_if_missing, load_queue_file, load_queue_file_with_revision, run_queue_file,
+    save_queue_file, save_queue_file_if_revision,
 };
 
 #[derive(Debug, Error)]
@@ -71,6 +72,8 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<BlockedReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_retry_at: Option<DateTime<Utc>>,
 }
 
@@ -84,11 +87,25 @@ pub enum TaskStatus {
     Blocked,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BlockedReasonCode {
+    DependencyUnavailable,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BlockedReason {
+    pub reason_code: BlockedReasonCode,
+    pub dependency_id: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BlockedTask {
     pub task_id: String,
-    pub reason: String,
+    pub reason_code: BlockedReasonCode,
+    pub dependency_id: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -147,7 +164,8 @@ pub fn build_execution_plan(queue: &Queue) -> Result<ExecutionPlan, QueueError> 
             unavailable.insert(task.id.as_str());
             blocked.push(BlockedTask {
                 task_id: task.id.clone(),
-                reason: format!("dependency failed or is blocked: {dependency}"),
+                reason_code: BlockedReasonCode::DependencyUnavailable,
+                dependency_id: dependency.to_owned(),
             });
         }
     }

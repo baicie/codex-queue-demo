@@ -1,24 +1,43 @@
 use std::env;
 use std::ffi::OsString;
-use std::fs;
-use std::io::Write;
+use std::fs::{self, File};
+use std::io::{self, Write};
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::Duration;
+use std::process::{Command, ExitStatus, Stdio};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+#[cfg(windows)]
+use process_wrap::std::CommandWrapper;
+#[cfg(windows)]
+use process_wrap::std::JobObject;
+#[cfg(unix)]
+use process_wrap::std::ProcessGroup;
+use process_wrap::std::{ChildWrapper, CommandWrap};
 
 use crate::{QueueRunner, Task, TransientTaskError};
 
+// Four 45-minute attempts plus the default backoff fit below the scheduler's
+// four-hour Windows limit, while each attempt can still handle substantial work.
+const DEFAULT_EXECUTION_TIMEOUT: Duration = Duration::from_secs(45 * 60);
+const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
 pub struct CodexCli {
     binary: OsString,
+    execution_timeout: Duration,
 }
 
 impl CodexCli {
     pub fn new(binary: impl Into<OsString>) -> Self {
+        Self::with_timeout(binary, DEFAULT_EXECUTION_TIMEOUT)
+    }
+
+    /// Creates a Codex runner with a custom timeout for each `codex exec` process.
+    pub fn with_timeout(binary: impl Into<OsString>, execution_timeout: Duration) -> Self {
         Self {
             binary: binary.into(),
+            execution_timeout,
         }
     }
 }
@@ -51,64 +70,14 @@ impl QueueRunner for CodexCli {
     }
 
     fn execute_task(&mut self, task: &Task, workspace: &Path, run_directory: &Path) -> Result<()> {
-        let final_output = run_directory.join("final.txt");
-        let mut child = Command::new(&self.binary)
-            .arg("-a")
-            .arg("never")
-            .arg("exec")
-            .arg("--json")
-            .arg("--ephemeral")
-            .arg("--skip-git-repo-check")
-            .arg("--sandbox")
-            .arg("workspace-write")
-            .arg("-C")
-            .arg(workspace)
-            .arg("-o")
-            .arg(&final_output)
-            .arg("-")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .with_context(|| format!("failed to start {:?}", self.binary))?;
-
-        let mut stdin = child.stdin.take().context("Codex stdin is unavailable")?;
-        stdin
-            .write_all(task.prompt.as_bytes())
-            .context("failed to send task prompt to Codex")?;
-        stdin
-            .write_all(b"\n")
-            .context("failed to terminate task prompt")?;
-        drop(stdin);
-
-        let output = child
-            .wait_with_output()
-            .context("failed while waiting for Codex")?;
-        fs::write(run_directory.join("events.jsonl"), &output.stdout)
-            .context("failed to write Codex event log")?;
-        fs::write(run_directory.join("stderr.log"), &output.stderr)
-            .context("failed to write Codex stderr log")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let terminal_error = terminal_failure_message(&output.stdout);
-            let details = if let Some(error) = terminal_error.as_deref() {
-                error
-            } else if !stderr.trim().is_empty() {
-                stderr.trim()
-            } else {
-                "see events.jsonl for details"
-            };
-            let message = format!(
-                "codex exec exited with status {}: {}",
-                output.status, details
-            );
-            if is_transient_codex_failure(&output.stdout, &output.stderr) {
-                return Err(TransientTaskError::new(message).into());
-            }
-            bail!("{message}");
-        }
-        Ok(())
+        execute_task_with_spawn(
+            &self.binary,
+            self.execution_timeout,
+            task,
+            workspace,
+            run_directory,
+            spawn_command_group,
+        )
     }
 
     fn wait_before_retry(&mut self, delay: Duration) {
@@ -117,6 +86,281 @@ impl QueueRunner for CodexCli {
             delay.as_secs()
         );
         thread::sleep(delay);
+    }
+}
+
+fn execute_task_with_spawn(
+    binary: &OsString,
+    execution_timeout: Duration,
+    task: &Task,
+    workspace: &Path,
+    run_directory: &Path,
+    spawn: impl FnOnce(Command) -> io::Result<Box<dyn ChildWrapper>>,
+) -> Result<()> {
+    let final_output = run_directory.join("final.txt");
+    let events_output = run_directory.join("events.jsonl");
+    let stderr_output = run_directory.join("stderr.log");
+    let events_file = File::create(&events_output)
+        .with_context(|| format!("failed to create {}", events_output.display()))?;
+    let stderr_file = File::create(&stderr_output)
+        .with_context(|| format!("failed to create {}", stderr_output.display()))?;
+    let mut command = Command::new(binary);
+    command
+        .arg("-a")
+        .arg("never")
+        .arg("exec")
+        .arg("--json")
+        .arg("--ephemeral")
+        .arg("--skip-git-repo-check")
+        .arg("--sandbox")
+        .arg("workspace-write")
+        .arg("-C")
+        .arg(workspace)
+        .arg("-o")
+        .arg(&final_output)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::from(events_file))
+        .stderr(Stdio::from(stderr_file));
+    let child = spawn(command).with_context(|| format!("failed to start {binary:?}"))?;
+    let mut child = SpawnedChildGuard::new(child);
+
+    let mut stdin = child
+        .child_mut()
+        .stdin()
+        .take()
+        .context("Codex stdin is unavailable")?;
+    let prompt = task.prompt.clone();
+    let stdin_writer = thread::spawn(move || -> Result<()> {
+        stdin
+            .write_all(prompt.as_bytes())
+            .context("failed to send task prompt to Codex")?;
+        stdin
+            .write_all(b"\n")
+            .context("failed to terminate task prompt")?;
+        Ok(())
+    });
+
+    let status = wait_for_exit(child.child_mut(), execution_timeout)
+        .context("failed while waiting for Codex")?;
+    let Some(status) = status else {
+        let cleanup_error = child.terminate_and_reap().err();
+        if cleanup_error.is_none() {
+            let _ = join_stdin_writer(stdin_writer);
+        }
+        return Err(timeout_error(execution_timeout, cleanup_error));
+    };
+    child
+        .terminate_and_reap()
+        .context("failed to clean up the Codex process tree")?;
+    let stdin_result = join_stdin_writer(stdin_writer);
+
+    let stdout = fs::read(&events_output).context("failed to read Codex event log")?;
+    let stderr = fs::read(&stderr_output).context("failed to read Codex stderr log")?;
+
+    if !status.success() {
+        let stderr_text = String::from_utf8_lossy(&stderr);
+        let terminal_error = terminal_failure_message(&stdout);
+        let details = if let Some(error) = terminal_error.as_deref() {
+            error
+        } else if !stderr_text.trim().is_empty() {
+            stderr_text.trim()
+        } else {
+            "see events.jsonl for details"
+        };
+        let message = format!("codex exec exited with status {status}: {details}");
+        if is_transient_codex_failure(&stdout, &stderr) {
+            return Err(TransientTaskError::new(message).into());
+        }
+        bail!("{message}");
+    }
+    stdin_result?;
+    Ok(())
+}
+
+fn spawn_command_group(command: Command) -> io::Result<Box<dyn ChildWrapper>> {
+    let mut command = CommandWrap::from(command);
+
+    #[cfg(windows)]
+    {
+        command.wrap(SpawnCleanup);
+        command.wrap(JobObject);
+    }
+
+    #[cfg(unix)]
+    command.wrap(ProcessGroup::leader());
+
+    command.spawn()
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+struct SpawnCleanup;
+
+#[cfg(windows)]
+impl CommandWrapper for SpawnCleanup {
+    fn wrap_child(
+        &mut self,
+        child: Box<dyn ChildWrapper>,
+        _command: &CommandWrap,
+    ) -> io::Result<Box<dyn ChildWrapper>> {
+        Ok(Box::new(SpawnCleanupChild::new(child)))
+    }
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug)]
+struct SpawnCleanupChild {
+    child: Option<Box<dyn ChildWrapper>>,
+    armed: bool,
+}
+
+#[cfg(any(windows, test))]
+impl SpawnCleanupChild {
+    fn new(child: Box<dyn ChildWrapper>) -> Self {
+        Self {
+            child: Some(child),
+            armed: true,
+        }
+    }
+
+    fn child(&self) -> &dyn ChildWrapper {
+        self.child.as_deref().expect("spawn cleanup child exists")
+    }
+
+    fn child_mut(&mut self) -> &mut dyn ChildWrapper {
+        self.child
+            .as_deref_mut()
+            .expect("spawn cleanup child exists")
+    }
+}
+
+#[cfg(any(windows, test))]
+impl ChildWrapper for SpawnCleanupChild {
+    fn inner(&self) -> &dyn ChildWrapper {
+        self.child().inner()
+    }
+
+    fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+        self.child_mut().inner_mut()
+    }
+
+    fn into_inner(mut self: Box<Self>) -> Box<dyn ChildWrapper> {
+        self.armed = false;
+        self.child.take().expect("spawn cleanup child exists")
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        let status = self.child_mut().try_wait()?;
+        if status.is_some() {
+            self.armed = false;
+        }
+        Ok(status)
+    }
+
+    fn wait(&mut self) -> io::Result<ExitStatus> {
+        let status = self.child_mut().wait()?;
+        self.armed = false;
+        Ok(status)
+    }
+}
+
+#[cfg(any(windows, test))]
+impl Drop for SpawnCleanupChild {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Some(child) = self.child.as_deref_mut() {
+                let _ = terminate_and_reap(child);
+            }
+        }
+    }
+}
+
+struct SpawnedChildGuard {
+    child: Box<dyn ChildWrapper>,
+    armed: bool,
+}
+
+impl SpawnedChildGuard {
+    fn new(child: Box<dyn ChildWrapper>) -> Self {
+        Self { child, armed: true }
+    }
+
+    fn child_mut(&mut self) -> &mut dyn ChildWrapper {
+        self.child.as_mut()
+    }
+
+    fn terminate_and_reap(&mut self) -> Result<()> {
+        let result = terminate_and_reap(self.child.as_mut());
+        if result.is_ok() {
+            self.disarm();
+        }
+        result
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SpawnedChildGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = terminate_and_reap(self.child.as_mut());
+        }
+    }
+}
+
+fn wait_for_exit(
+    child: &mut dyn ChildWrapper,
+    timeout: Duration,
+) -> io::Result<Option<ExitStatus>> {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+
+        let elapsed = started.elapsed();
+        if elapsed >= timeout {
+            return Ok(None);
+        }
+        thread::sleep(PROCESS_POLL_INTERVAL.min(timeout - elapsed));
+    }
+}
+
+fn terminate_and_reap(child: &mut dyn ChildWrapper) -> Result<()> {
+    if let Err(kill_error) = child.start_kill() {
+        match child.try_wait() {
+            Ok(Some(_)) => {}
+            Ok(None) => return Err(kill_error).context("failed to kill Codex process"),
+            Err(wait_error) => {
+                bail!(
+                    "failed to kill Codex process: {kill_error}; failed to inspect it afterward: {wait_error}"
+                );
+            }
+        }
+    }
+    child.wait().context("failed to reap Codex process")?;
+    Ok(())
+}
+
+fn timeout_error(
+    execution_timeout: Duration,
+    cleanup_error: Option<anyhow::Error>,
+) -> anyhow::Error {
+    let timeout_message = format!("codex exec timed out after {execution_timeout:?}");
+    if let Some(error) = cleanup_error {
+        anyhow::anyhow!("{timeout_message}; failed to clean up the process: {error:#}")
+    } else {
+        TransientTaskError::new(timeout_message).into()
+    }
+}
+
+fn join_stdin_writer(writer: JoinHandle<Result<()>>) -> Result<()> {
+    match writer.join() {
+        Ok(result) => result,
+        Err(_) => bail!("Codex stdin writer panicked"),
     }
 }
 
@@ -270,7 +514,169 @@ mod tests {
 
 #[cfg(test)]
 mod retry_tests {
-    use super::is_transient_codex_failure;
+    use std::io;
+    use std::process::{ChildStdin, ExitStatus};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use chrono::Utc;
+    use process_wrap::std::ChildWrapper;
+    use tempfile::TempDir;
+
+    use crate::{Task, TaskStatus, TransientTaskError};
+
+    use super::{
+        SpawnCleanupChild, execute_task_with_spawn, is_transient_codex_failure, timeout_error,
+    };
+
+    #[derive(Debug)]
+    struct RecordingChild {
+        stdin: Option<ChildStdin>,
+        killed: Arc<AtomicBool>,
+        waited: Arc<AtomicBool>,
+        status: ExitStatus,
+    }
+
+    impl ChildWrapper for RecordingChild {
+        fn inner(&self) -> &dyn ChildWrapper {
+            self
+        }
+
+        fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+            self
+        }
+
+        fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
+            self
+        }
+
+        fn stdin(&mut self) -> &mut Option<ChildStdin> {
+            &mut self.stdin
+        }
+
+        fn start_kill(&mut self) -> io::Result<()> {
+            self.killed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+            Ok(None)
+        }
+
+        fn wait(&mut self) -> io::Result<ExitStatus> {
+            self.waited.store(true, Ordering::SeqCst);
+            Ok(self.status)
+        }
+    }
+
+    #[cfg(unix)]
+    fn successful_exit_status() -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+
+        ExitStatus::from_raw(0)
+    }
+
+    #[cfg(windows)]
+    fn successful_exit_status() -> ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+
+        ExitStatus::from_raw(0)
+    }
+
+    #[test]
+    fn reaps_a_spawned_child_when_setup_fails() {
+        let temp = TempDir::new().expect("temp directory");
+        let workspace = temp.path().join("workspace");
+        let run_directory = temp.path().join("run");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&run_directory).unwrap();
+        let killed = Arc::new(AtomicBool::new(false));
+        let waited = Arc::new(AtomicBool::new(false));
+        let child_killed = Arc::clone(&killed);
+        let child_waited = Arc::clone(&waited);
+
+        let error = execute_task_with_spawn(
+            &"unused-codex".into(),
+            Duration::from_secs(1),
+            &task(),
+            &workspace,
+            &run_directory,
+            move |_| {
+                Ok(Box::new(RecordingChild {
+                    stdin: None,
+                    killed: child_killed,
+                    waited: child_waited,
+                    status: successful_exit_status(),
+                }))
+            },
+        )
+        .expect_err("missing child stdin should fail setup");
+
+        assert!(error.to_string().contains("stdin is unavailable"));
+        assert!(
+            killed.load(Ordering::SeqCst),
+            "spawned child was not killed"
+        );
+        assert!(
+            waited.load(Ordering::SeqCst),
+            "spawned child was not reaped"
+        );
+    }
+
+    #[test]
+    fn reaps_a_raw_child_dropped_during_spawn_wrapping() {
+        let killed = Arc::new(AtomicBool::new(false));
+        let waited = Arc::new(AtomicBool::new(false));
+        let cleanup = SpawnCleanupChild::new(Box::new(RecordingChild {
+            stdin: None,
+            killed: Arc::clone(&killed),
+            waited: Arc::clone(&waited),
+            status: successful_exit_status(),
+        }));
+
+        drop(cleanup);
+
+        assert!(killed.load(Ordering::SeqCst), "raw child was not killed");
+        assert!(waited.load(Ordering::SeqCst), "raw child was not reaped");
+    }
+
+    #[test]
+    fn disarms_spawn_cleanup_after_a_successful_wait() {
+        let killed = Arc::new(AtomicBool::new(false));
+        let waited = Arc::new(AtomicBool::new(false));
+        let mut cleanup = SpawnCleanupChild::new(Box::new(RecordingChild {
+            stdin: None,
+            killed: Arc::clone(&killed),
+            waited: Arc::clone(&waited),
+            status: successful_exit_status(),
+        }));
+
+        cleanup.wait().expect("child wait succeeds");
+        drop(cleanup);
+
+        assert!(!killed.load(Ordering::SeqCst), "exited child was killed");
+        assert!(waited.load(Ordering::SeqCst), "raw child was reaped");
+    }
+
+    fn task() -> Task {
+        Task {
+            id: "cleanup-test".to_owned(),
+            title: "Cleanup test".to_owned(),
+            workspace: ".".to_owned(),
+            prompt: "test".to_owned(),
+            priority: 1,
+            depends_on: Vec::new(),
+            status: TaskStatus::Pending,
+            created_at: Utc::now(),
+            attempts: None,
+            started_at: None,
+            finished_at: None,
+            last_error: None,
+            blocked_reason: None,
+            next_retry_at: None,
+        }
+    }
 
     #[test]
     fn recognizes_retryable_network_and_api_failures() {
@@ -321,5 +727,16 @@ mod retry_tests {
             br#"{"type":"turn.failed","error":{"message":"unsupported region"}}"#,
             b"remote plugin sync failed with status 503 Service Unavailable"
         ));
+    }
+
+    #[test]
+    fn does_not_retry_when_a_timed_out_process_tree_cannot_be_terminated() {
+        let error = timeout_error(
+            Duration::from_secs(1),
+            Some(anyhow::anyhow!("job termination failed")),
+        );
+
+        assert!(error.downcast_ref::<TransientTaskError>().is_none());
+        assert!(error.to_string().contains("failed to clean up the process"));
     }
 }

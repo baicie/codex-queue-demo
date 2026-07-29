@@ -185,8 +185,17 @@ fn blocks_tasks_whose_dependencies_failed() {
     assert_eq!(plan.blocked.len(), 1);
     assert_eq!(plan.blocked[0].task_id, "child");
     assert_eq!(
-        plan.blocked[0].reason,
-        "dependency failed or is blocked: failed-parent"
+        plan.blocked[0].reason_code,
+        codex_queue_demo::BlockedReasonCode::DependencyUnavailable
+    );
+    assert_eq!(plan.blocked[0].dependency_id, "failed-parent");
+    assert_eq!(
+        serde_json::to_value(&plan.blocked[0]).expect("serialize blocked reason"),
+        json!({
+            "taskId": "child",
+            "reasonCode": "dependencyUnavailable",
+            "dependencyId": "failed-parent"
+        })
     );
 }
 
