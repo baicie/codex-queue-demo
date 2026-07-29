@@ -2,6 +2,10 @@ target/
 runs/
 *.lock
 .env
+.env.*
+!.env.example
+*.pem
+*.key
 .DS_Store
 node_modules/
 dist/

@@ -11,74 +11,167 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
+  NODE_VERSION: "24"
+  RUST_VERSION: "1.88.0"
 
 jobs:
-  quality:
-    name: Format, lint, and build
+  workflow-lint:
+    name: Workflow syntax and policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Lint GitHub Actions workflows
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/ci.yml .github/workflows/release.yml
+
+  frontend:
+    name: Frontend quality
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - name: Check out source
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - name: Install stable Rust
-        run: |
-          rustup toolchain install stable --profile minimal --component rustfmt,clippy
-          rustup default stable
-          rustc --version
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Audit frontend dependencies
+        run: npm audit --audit-level=high --registry=https://registry.npmjs.org
 
       - name: Check formatting
+        run: npm run format:check
+
+      - name: Lint frontend
+        run: npm run lint
+
+      - name: Run frontend tests
+        run: npm test
+
+      - name: Build frontend
+        run: npm run build
+
+  rust:
+    name: Rust workspace quality
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust ${{ env.RUST_VERSION }}
+        run: |
+          rustup toolchain install "${{ env.RUST_VERSION }}" --profile minimal --component rustfmt,clippy
+          rustup default "${{ env.RUST_VERSION }}"
+          rustc --version
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: ". -> target"
+
+      - name: Check Rust formatting
         run: cargo fmt --all -- --check
 
+      - name: Install RustSec cargo-audit
+        uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
+        with:
+          tool: cargo-audit@0.22.2
+          checksum: true
+          fallback: none
+
+      - name: Audit Rust dependencies
+        run: cargo audit
+
+      - name: Run workspace tests
+        run: cargo test --locked --workspace --all-targets
+
       - name: Run Clippy
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
-      - name: Build release binary
-        run: cargo build --locked --release
-
-  compatibility:
-    name: Rust 1.85 / ${{ matrix.os }}
+  desktop:
+    name: Tauri build / ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
+        include:
+          - label: macOS
+            os: macos-latest
+          - label: Windows 11
+            os: windows-latest
     steps:
       - name: Check out source
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - name: Install Rust 1.85
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install Rust ${{ env.RUST_VERSION }}
         run: |
-          rustup toolchain install 1.85.0 --profile minimal
-          rustup default 1.85.0
+          rustup toolchain install "${{ env.RUST_VERSION }}" --profile minimal
+          rustup default "${{ env.RUST_VERSION }}"
           rustc --version
 
-      - name: Run tests
-        run: cargo test --locked --all-targets
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: ". -> target"
 
-      - name: Validate macOS installer
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Check Tauri backend
+        run: cargo check --locked --package codex-queue-desktop --all-targets
+
+      - name: Run workspace tests on Windows
+        if: runner.os == 'Windows'
+        run: cargo test --locked --workspace --all-targets
+
+      - name: Build native Tauri application
+        run: npm run tauri build -- --no-bundle
+
+      - name: Build scheduled CLI
+        run: cargo build --locked --release --package codex-queue-demo
+
+      - name: Validate macOS scheduler scripts
         if: runner.os == 'macOS'
         run: |
-          zsh -n scripts/install-macos.sh scripts/uninstall-macos.sh
-          cargo build --locked --release
-          ./scripts/install-macos.sh --dry-run --codex-bin /usr/bin/true >/dev/null
+          zsh -n scripts/install-macos.sh scripts/uninstall-macos.sh scripts/tests/test-scheduler.zsh
+          zsh scripts/tests/test-scheduler.zsh
+          ./scripts/install-macos.sh --dry-run --queue demo/queue.json --codex-bin /usr/bin/true >/dev/null
 
-      - name: Parse PowerShell installers
+      - name: Validate Windows scheduler scripts
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $allErrors = @()
-          Get-ChildItem -LiteralPath scripts -Filter '*.ps1' | ForEach-Object {
+          Get-ChildItem -LiteralPath scripts -Filter '*.ps1' -Recurse | ForEach-Object {
             $tokens = $null
             $parseErrors = $null
             [System.Management.Automation.Language.Parser]::ParseFile(
@@ -96,9 +189,5 @@ jobs:
             exit 1
           }
 
-      - name: Dry-run Windows installer
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          cargo build --locked --release
+          powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\scripts\tests\test-scheduler.ps1
           ./scripts/install-windows.ps1 -WhatIf -CodexBin "$env:SystemRoot\System32\cmd.exe"
