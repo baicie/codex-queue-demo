@@ -41,7 +41,7 @@ function New-CodexQueueTaskXml {
     )
 
     $document = New-Object System.Xml.XmlDocument
-    [void]$document.AppendChild($document.CreateXmlDeclaration('1.0', 'utf-8', $null))
+    [void]$document.AppendChild($document.CreateXmlDeclaration('1.0', $null, $null))
     $task = $document.CreateElement('Task', $TaskNamespace)
     $task.SetAttribute('version', '1.3')
     [void]$document.AppendChild($task)

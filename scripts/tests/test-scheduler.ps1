@@ -305,7 +305,11 @@ try {
         $env:PATH = $originalPath
     }
 
-    $taskXml = [xml](Get-Content -LiteralPath $taskXmlPath -Raw)
+    $taskXmlContent = Get-Content -LiteralPath $taskXmlPath -Raw
+    if ($taskXmlContent -match '<\?xml[^>]*encoding=') {
+        throw 'Task XML passed as a .NET string must not declare a byte encoding'
+    }
+    $taskXml = [xml]$taskXmlContent
     $namespace = [System.Xml.XmlNamespaceManager]::new($taskXml.NameTable)
     $namespace.AddNamespace('task', 'http://schemas.microsoft.com/windows/2004/02/mit/task')
 
