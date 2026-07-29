@@ -31,6 +31,7 @@ describe("desktopClient in Tauri", () => {
     const queue = createEmptyQueue();
     const snapshot: QueueSnapshot = {
       path: "/tmp/queue.json",
+      revision: "revision-1",
       queue,
       orderedIds: [],
       blocked: [],
@@ -51,13 +52,21 @@ describe("desktopClient in Tauri", () => {
 
     await desktopClient.getAppInfo();
     await desktopClient.loadQueue(snapshot.path);
-    await desktopClient.saveQueue(snapshot.path, queue);
+    await desktopClient.saveQueue(snapshot.path, queue, snapshot.revision);
     await desktopClient.runQueue(snapshot.path, "/opt/codex");
 
     expect(invokeMock.mock.calls).toEqual([
       ["app_info"],
       ["load_queue", { path: snapshot.path }],
-      ["save_queue", { path: snapshot.path, queue }],
+      [
+        "save_queue",
+        {
+          path: snapshot.path,
+          queue,
+          expectedRevision: snapshot.revision,
+          expectedRevisionPath: snapshot.path,
+        },
+      ],
       ["run_queue", { path: snapshot.path, codexBin: "/opt/codex" }],
     ]);
   });
@@ -66,6 +75,7 @@ describe("desktopClient in Tauri", () => {
     const queue = createEmptyQueue();
     const snapshot: QueueSnapshot = {
       path: "/tmp/opened.json",
+      revision: "revision-opened",
       queue,
       orderedIds: [],
       blocked: [],
@@ -86,24 +96,28 @@ describe("desktopClient in Tauri", () => {
     const queue = createEmptyQueue();
     const snapshot: QueueSnapshot = {
       path: "/tmp/saved.json",
+      revision: "revision-saved",
       queue,
       orderedIds: [],
       blocked: [],
     };
-    saveMock.mockResolvedValueOnce(null).mockResolvedValueOnce(snapshot.path);
+    const selectedPath = "/tmp/./saved.json";
+    saveMock.mockResolvedValueOnce(null).mockResolvedValueOnce(selectedPath);
     invokeMock.mockResolvedValueOnce(snapshot);
 
     await expect(
-      desktopClient.saveQueueFile(queue, "/tmp/suggested.json"),
+      desktopClient.saveQueueFile(queue, snapshot.path, "revision-before-save"),
     ).resolves.toBeNull();
     await expect(
-      desktopClient.saveQueueFile(queue, "/tmp/suggested.json"),
+      desktopClient.saveQueueFile(queue, snapshot.path, "revision-before-save"),
     ).resolves.toEqual(snapshot);
 
     expect(invokeMock).toHaveBeenCalledOnce();
     expect(invokeMock).toHaveBeenCalledWith("save_queue", {
-      path: snapshot.path,
+      path: selectedPath,
       queue,
+      expectedRevision: "revision-before-save",
+      expectedRevisionPath: snapshot.path,
     });
   });
 
@@ -136,7 +150,11 @@ describe("desktopClient in a browser", () => {
       ),
     };
 
-    await desktopClient.saveQueue(appInfo.defaultQueuePath, edited);
+    await desktopClient.saveQueue(
+      appInfo.defaultQueuePath,
+      edited,
+      seeded.revision,
+    );
     const reloaded = await desktopClient.loadQueue(appInfo.defaultQueuePath);
 
     expect(appInfo.platform).toBe("browser");
@@ -160,6 +178,59 @@ describe("desktopClient in a browser", () => {
     ).resolves.toEqual(saved);
   });
 
+  it("migrates an existing raw browser queue to a revisioned envelope", async () => {
+    const path = "browser://queues/legacy.json";
+    const queue = createEmptyQueue();
+    localStorage.setItem(`codex-queue.queue:${path}`, JSON.stringify(queue));
+
+    const loaded = await desktopClient.loadQueue(path);
+    const stored = JSON.parse(
+      localStorage.getItem(`codex-queue.queue:${path}`) ?? "null",
+    );
+
+    expect(loaded.revision).toEqual(expect.any(String));
+    expect(loaded.revision).not.toBe("");
+    expect(stored).toEqual({ revision: loaded.revision, queue });
+  });
+
+  it("serializes browser saves with a cross-context exclusive lock", async () => {
+    const originalLocks = Object.getOwnPropertyDescriptor(
+      window.navigator,
+      "locks",
+    );
+    const request = vi.fn(
+      async (_name: string, _options: LockOptions, callback: () => unknown) =>
+        callback(),
+    );
+    Object.defineProperty(window.navigator, "locks", {
+      configurable: true,
+      value: { request } as unknown as LockManager,
+    });
+
+    try {
+      const { defaultQueuePath } = await desktopClient.getAppInfo();
+      const loaded = await desktopClient.loadQueue(defaultQueuePath);
+
+      await desktopClient.saveQueue(
+        defaultQueuePath,
+        { ...loaded.queue, launchApp: false },
+        loaded.revision,
+      );
+
+      expect(request).toHaveBeenCalledWith(
+        `codex-queue.queue-lock:${defaultQueuePath}`,
+        { mode: "exclusive" },
+        expect.any(Function),
+      );
+    } finally {
+      if (originalLocks) {
+        Object.defineProperty(window.navigator, "locks", originalLocks);
+      } else {
+        Reflect.deleteProperty(window.navigator, "locks");
+      }
+    }
+  });
+
   it("simulates a queue run and persists succeeded task state", async () => {
     const { defaultQueuePath } = await desktopClient.getAppInfo();
     const before = await desktopClient.loadQueue(defaultQueuePath);
@@ -172,6 +243,77 @@ describe("desktopClient in a browser", () => {
     expect(after.queue.tasks.every((task) => task.status === "succeeded")).toBe(
       true,
     );
+  });
+
+  it("persists a structured reason when a browser task is blocked", async () => {
+    const path = "browser://queues/blocked.json";
+    const queue = createEmptyQueue();
+    queue.tasks = [
+      {
+        id: "failed-parent",
+        title: "Failed parent",
+        workspace: ".",
+        prompt: "Fail",
+        priority: 10,
+        dependsOn: [],
+        status: "failed",
+        createdAt: "2026-07-28T00:00:00Z",
+      },
+      {
+        id: "blocked-child",
+        title: "Blocked child",
+        workspace: ".",
+        prompt: "Wait for parent",
+        priority: 5,
+        dependsOn: ["failed-parent"],
+        status: "pending",
+        createdAt: "2026-07-28T00:01:00Z",
+      },
+    ];
+    await desktopClient.saveQueueFile(queue, path);
+
+    await desktopClient.runQueue(path);
+    const persisted = await desktopClient.loadQueue(path);
+    const child = persisted.queue.tasks.find(
+      (task) => task.id === "blocked-child",
+    );
+
+    expect(child).toEqual(
+      expect.objectContaining({
+        status: "blocked",
+        blockedReason: {
+          reasonCode: "dependencyUnavailable",
+          dependencyId: "failed-parent",
+        },
+      }),
+    );
+    expect(child).not.toHaveProperty("lastError");
+  });
+
+  it("rejects a stale browser save without overwriting newer task state", async () => {
+    const { defaultQueuePath } = await desktopClient.getAppInfo();
+    const stale = await desktopClient.loadQueue(defaultQueuePath);
+    const schedulerQueue = {
+      ...stale.queue,
+      tasks: stale.queue.tasks.map((task, index) =>
+        index === 0 ? { ...task, status: "succeeded" as const } : task,
+      ),
+    };
+    const schedulerSnapshot = await desktopClient.saveQueue(
+      defaultQueuePath,
+      schedulerQueue,
+      stale.revision,
+    );
+    const staleUiQueue = { ...stale.queue, launchApp: false };
+
+    await expect(
+      desktopClient.saveQueue(defaultQueuePath, staleUiQueue, stale.revision),
+    ).rejects.toThrow("queue changed since it was loaded");
+
+    const preserved = await desktopClient.loadQueue(defaultQueuePath);
+    expect(preserved.revision).toBe(schedulerSnapshot.revision);
+    expect(preserved.queue.tasks[0].status).toBe("succeeded");
+    expect(preserved.queue.launchApp).toBe(stale.queue.launchApp);
   });
 
   it("reports missing browser queues with a readable path", async () => {

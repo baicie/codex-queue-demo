@@ -80,6 +80,7 @@ export const en = {
       new: "New task",
       edit: "Edit task",
       delete: "Delete task",
+      requeue: "Requeue",
       deleteTitle: "Delete task?",
       deleteDescription:
         'Delete task "{{title}}"? This action cannot be undone.',
@@ -90,6 +91,7 @@ export const en = {
       priority: "Priority",
       dependencies: "Dependencies",
       noDependencies: "No dependencies",
+      dependencyCreatesCycle: "Would create a dependency cycle",
       attempts: "{{count}} attempts",
       attempts_one: "{{count}} attempt",
       attempts_other: "{{count}} attempts",
@@ -134,6 +136,10 @@ export const en = {
         dependencyCount_one: "{{count}} dependency",
         dependencyCount_other: "{{count}} dependencies",
       },
+      blockedReason: {
+        dependencyUnavailable:
+          "Dependency task {{dependencyId}} failed or is blocked",
+      },
       form: {
         createTitle: "New task",
         editTitle: "Edit task",
@@ -151,6 +157,7 @@ export const en = {
         workspaceRequired: "Choose a workspace",
         promptRequired: "Enter a task prompt",
         dependencySelf: "A task cannot depend on itself",
+        priorityInvalid: "Priority must be an integer",
       },
     },
     retryPolicy: {
@@ -176,6 +183,12 @@ export const en = {
       seconds: "seconds",
       codexBin: "Codex CLI path",
       codexBinPlaceholder: "Leave empty to use codex from PATH",
+      validation: {
+        maxAttempts: "Maximum attempts must be an integer from 1 to 20",
+        initialDelay: "Initial delay must be a positive integer",
+        maxDelay:
+          "Maximum delay must be at least the initial delay and no more than 86400 seconds",
+      },
     },
     confirmation: {
       deleteTaskTitle: "Delete task?",
@@ -192,10 +205,11 @@ export const en = {
       loadingQueue: "Loading queue...",
       savingQueue: "Saving queue...",
       runningQueue: "Running queue...",
+      runProgress: "{{completed}} / {{total}} completed",
       emptyQueueTitle: "No tasks in this queue",
       emptyQueueDescription: "Create a task to start orchestrating Codex work.",
       noResultsTitle: "No matching tasks",
-      noResultsDescription: "Adjust the search or status filters.",
+      noResultsDescription: "Choose another status filter to view more tasks.",
     },
     errors: {
       generic: "An unknown error occurred",
@@ -257,7 +271,7 @@ export const en = {
     },
     accessibility: {
       mainNavigation: "Main navigation",
-      taskActions: "Task actions for {{title}}",
+      taskActions: "More actions for {{title}}",
       changeLanguage: "Change language",
       changeTheme: "Change theme",
     },

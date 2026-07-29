@@ -79,6 +79,7 @@ export const zhCN = {
       new: "新建任务",
       edit: "编辑任务",
       delete: "删除任务",
+      requeue: "重新入队",
       deleteTitle: "删除任务？",
       deleteDescription: "确定删除任务“{{title}}”吗？此操作无法撤销。",
       title: "标题",
@@ -88,6 +89,7 @@ export const zhCN = {
       priority: "优先级",
       dependencies: "依赖任务",
       noDependencies: "无依赖",
+      dependencyCreatesCycle: "会形成循环依赖",
       attempts: "{{count}} 次尝试",
       attempts_one: "{{count}} 次尝试",
       attempts_other: "{{count}} 次尝试",
@@ -131,6 +133,9 @@ export const zhCN = {
         dependencyCount_one: "{{count}} 个依赖",
         dependencyCount_other: "{{count}} 个依赖",
       },
+      blockedReason: {
+        dependencyUnavailable: "依赖任务 {{dependencyId}} 已失败或被阻塞",
+      },
       form: {
         createTitle: "新建任务",
         editTitle: "编辑任务",
@@ -147,6 +152,7 @@ export const zhCN = {
         workspaceRequired: "请选择工作区",
         promptRequired: "请输入任务指令",
         dependencySelf: "任务不能依赖自身",
+        priorityInvalid: "优先级必须是整数",
       },
     },
     retryPolicy: {
@@ -170,6 +176,11 @@ export const zhCN = {
       seconds: "秒",
       codexBin: "Codex CLI 路径",
       codexBinPlaceholder: "留空以使用 PATH 中的 codex",
+      validation: {
+        maxAttempts: "最大尝试次数必须是 1 到 20 的整数",
+        initialDelay: "初始延迟必须是正整数",
+        maxDelay: "最大延迟必须不小于初始延迟，且不超过 86400 秒",
+      },
     },
     confirmation: {
       deleteTaskTitle: "删除任务？",
@@ -183,10 +194,11 @@ export const zhCN = {
       loadingQueue: "正在加载队列…",
       savingQueue: "正在保存队列…",
       runningQueue: "正在运行队列…",
+      runProgress: "已完成 {{completed}} / {{total}}",
       emptyQueueTitle: "队列中还没有任务",
       emptyQueueDescription: "新建一个任务以开始编排 Codex 工作。",
       noResultsTitle: "没有匹配的任务",
-      noResultsDescription: "调整搜索内容或状态筛选条件。",
+      noResultsDescription: "调整状态筛选条件以查看其他任务。",
     },
     errors: {
       generic: "发生未知错误",
@@ -248,7 +260,7 @@ export const zhCN = {
     },
     accessibility: {
       mainNavigation: "主导航",
-      taskActions: "{{title}} 的任务操作",
+      taskActions: "{{title}}的更多操作",
       changeLanguage: "切换语言",
       changeTheme: "切换主题",
     },

@@ -69,6 +69,7 @@ const requiredTranslationKeys = [
   "task.attempts",
   "task.nextRetry",
   "task.lastError",
+  "task.blockedReason.dependencyUnavailable",
   "task.planPosition",
   "task.createdAt",
   "task.save",

@@ -46,10 +46,12 @@ describe("queue domain contract", () => {
     };
     const blocked: BlockedTask = {
       taskId: task.id,
-      reason: "dependency failed or is blocked: build",
+      reasonCode: "dependencyUnavailable",
+      dependencyId: "build",
     };
     const snapshot: QueueSnapshot = {
       path: "/tmp/queue.json",
+      revision: "revision-1",
       queue,
       orderedIds: [task.id],
       blocked: [blocked],
@@ -68,6 +70,7 @@ describe("queue domain contract", () => {
     expect({ snapshot, appInfo, summary }).toEqual({
       snapshot: {
         path: "/tmp/queue.json",
+        revision: "revision-1",
         queue,
         orderedIds: [task.id],
         blocked: [blocked],
@@ -130,25 +133,18 @@ describe("queue domain contract", () => {
       task({ id: "low", priority: 1, createdAt: "2026-07-28T00:00:00Z" }),
     ];
 
-    expect(createQueueSnapshot("queue.json", queue).orderedIds).toEqual([
-      "a-task",
-      "z-task",
-      "later",
-      "low",
-    ]);
+    expect(
+      createQueueSnapshot("queue.json", queue, "revision-1").orderedIds,
+    ).toEqual(["a-task", "z-task", "later", "low"]);
   });
 
   it("uses Rust-compatible ASCII ordering when task IDs break a tie", () => {
     const queue = createEmptyQueue();
     queue.tasks = ["a", "A", "_", "-", "0"].map((id) => task({ id }));
 
-    expect(createQueueSnapshot("queue.json", queue).orderedIds).toEqual([
-      "-",
-      "0",
-      "A",
-      "_",
-      "a",
-    ]);
+    expect(
+      createQueueSnapshot("queue.json", queue, "revision-1").orderedIds,
+    ).toEqual(["-", "0", "A", "_", "a"]);
   });
 
   it("propagates failed dependencies into blocked tasks", () => {
@@ -159,17 +155,20 @@ describe("queue domain contract", () => {
       task({ id: "blocked-grandchild", dependsOn: ["blocked-child"] }),
     ];
 
-    const snapshot = createQueueSnapshot("queue.json", queue);
+    const snapshot = createQueueSnapshot("queue.json", queue, "revision-1");
 
+    expect(snapshot.revision).toBe("revision-1");
     expect(snapshot.orderedIds).toEqual([]);
     expect(snapshot.blocked).toEqual([
       {
         taskId: "blocked-child",
-        reason: "dependency failed or is blocked: failed",
+        reasonCode: "dependencyUnavailable",
+        dependencyId: "failed",
       },
       {
         taskId: "blocked-grandchild",
-        reason: "dependency failed or is blocked: blocked-child",
+        reasonCode: "dependencyUnavailable",
+        dependencyId: "blocked-child",
       },
     ]);
   });

@@ -27,6 +27,7 @@ export interface Task {
   startedAt?: string;
   finishedAt?: string;
   lastError?: string;
+  blockedReason?: BlockedReason;
   nextRetryAt?: string;
 }
 
@@ -37,13 +38,20 @@ export interface Queue {
   tasks: Task[];
 }
 
-export interface BlockedTask {
+export type BlockedReasonCode = "dependencyUnavailable";
+
+export interface BlockedReason {
+  reasonCode: BlockedReasonCode;
+  dependencyId: string;
+}
+
+export interface BlockedTask extends BlockedReason {
   taskId: string;
-  reason: string;
 }
 
 export interface QueueSnapshot {
   path: string;
+  revision: string;
   queue: Queue;
   orderedIds: string[];
   blocked: BlockedTask[];
@@ -129,11 +137,15 @@ export function createTaskId(): string {
   return `task-${Date.now().toString(36)}-${fallbackIdCounter.toString(36)}`;
 }
 
-export function createQueueSnapshot(path: string, queue: Queue): QueueSnapshot {
+export function createQueueSnapshot(
+  path: string,
+  queue: Queue,
+  revision: string,
+): QueueSnapshot {
   validateQueue(queue);
   const { orderedIds, blocked } = buildExecutionPlan(queue);
 
-  return { path, queue, orderedIds, blocked };
+  return { path, revision, queue, orderedIds, blocked };
 }
 
 export function validateQueue(value: unknown): asserts value is Queue {
@@ -214,7 +226,8 @@ function buildExecutionPlan(queue: Queue): {
       unavailable.add(task.id);
       blocked.push({
         taskId: task.id,
-        reason: `dependency failed or is blocked: ${dependency}`,
+        reasonCode: "dependencyUnavailable",
+        dependencyId: dependency,
       });
     }
   }
@@ -308,7 +321,23 @@ function validateTask(value: unknown): asserts value is Task {
   validateOptionalDateTime(value.startedAt, `task ${id} startedAt`);
   validateOptionalDateTime(value.finishedAt, `task ${id} finishedAt`);
   validateOptionalString(value.lastError, `task ${id} lastError`);
+  validateOptionalBlockedReason(
+    value.blockedReason,
+    `task ${id} blockedReason`,
+  );
   validateOptionalDateTime(value.nextRetryAt, `task ${id} nextRetryAt`);
+}
+
+function validateOptionalBlockedReason(value: unknown, name: string): void {
+  if (value === undefined) return;
+  if (
+    !isRecord(value) ||
+    value.reasonCode !== "dependencyUnavailable" ||
+    typeof value.dependencyId !== "string" ||
+    value.dependencyId.length === 0
+  ) {
+    throw new Error(`${name} is invalid`);
+  }
 }
 
 function assertAcyclic(tasksById: ReadonlyMap<string, Task>): void {
