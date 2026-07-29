@@ -1,0 +1,570 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  NODE_VERSION: "24"
+  RUST_VERSION: "1.88.0"
+
+jobs:
+  validate-release:
+    name: Validate tag and version
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      source_commit: ${{ steps.bind-source.outputs.source_commit }}
+    steps:
+      - name: Check out source and history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install Rust ${{ env.RUST_VERSION }}
+        run: |
+          rustup toolchain install "${{ env.RUST_VERSION }}" --profile minimal
+          rustup default "${{ env.RUST_VERSION }}"
+          rustc --version
+
+      - name: Bind the release to the event source commit
+        id: bind-source
+        env:
+          RELEASE_SOURCE_COMMIT: ${{ github.sha }}
+        shell: bash
+        run: |
+          git fetch --no-tags --force origin \
+            "+refs/heads/main:refs/remotes/origin/main" \
+            "+refs/tags/${GITHUB_REF_NAME}:refs/codex-release/remote-tag"
+
+          source_commit="$(git rev-parse --verify "${RELEASE_SOURCE_COMMIT}^{commit}")"
+          checkout_commit="$(git rev-parse --verify 'HEAD^{commit}')"
+          tag_commit="$(git rev-parse --verify 'refs/codex-release/remote-tag^{commit}')"
+
+          if [[ "$checkout_commit" != "$source_commit" ]]; then
+            echo "::error::Checked-out commit $checkout_commit does not match release source commit $source_commit."
+            exit 1
+          fi
+          if [[ "$tag_commit" != "$source_commit" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME resolved to $tag_commit, but this workflow was triggered for $source_commit."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$source_commit" refs/remotes/origin/main; then
+            echo "::error::Release source commit $source_commit is not an ancestor of origin/main."
+            exit 1
+          fi
+
+          echo "Release source commit: $source_commit"
+          echo "source_commit=$source_commit" >> "$GITHUB_OUTPUT"
+
+      - name: Match tag, package versions, and Rust MSRV
+        run: |
+          node --input-type=module <<'NODE'
+          import { execFileSync } from "node:child_process"
+          import { readFileSync } from "node:fs"
+
+          const tag = process.env.GITHUB_REF_NAME
+          const tauriVersion = JSON.parse(
+            readFileSync("src-tauri/tauri.conf.json", "utf8"),
+          ).version
+          const frontendVersion = JSON.parse(
+            readFileSync("package.json", "utf8"),
+          ).version
+          const metadata = JSON.parse(
+            execFileSync(
+              "cargo",
+              ["metadata", "--locked", "--no-deps", "--format-version", "1"],
+              { encoding: "utf8" },
+            ),
+          )
+          const rustPackages = metadata.packages.filter(({ name }) =>
+            ["codex-queue-demo", "codex-queue-desktop"].includes(name),
+          )
+          const rustVersions = rustPackages.map(
+            ({ name, version }) => `${name}@${version}`,
+          )
+          const rustMsrvs = rustPackages.map(
+            ({ name, rust_version: rustVersion }) => `${name}@${rustVersion}`,
+          )
+
+          const expectedTag = `v${tauriVersion}`
+          const versionsMatch =
+            frontendVersion === tauriVersion &&
+            rustPackages.length === 2 &&
+            rustPackages.every(({ version }) => version === tauriVersion)
+          const msrvsMatch = rustPackages.every(
+            ({ rust_version: rustVersion }) => rustVersion === "1.88",
+          )
+
+          if (tag !== expectedTag || !versionsMatch || !msrvsMatch) {
+            console.error(
+              `Release metadata mismatch: tag=${tag}, tauri=${tauriVersion}, frontend=${frontendVersion}, rust=${rustVersions.join(",")}, msrv=${rustMsrvs.join(",")}`,
+            )
+            process.exit(1)
+          }
+          NODE
+
+  quality-gate:
+    name: Full quality gate
+    needs: validate-release
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify release tag still targets the source commit
+        env:
+          RELEASE_SOURCE_COMMIT: ${{ needs.validate-release.outputs.source_commit }}
+        shell: bash
+        run: |
+          git fetch --no-tags --force origin \
+            "+refs/tags/${GITHUB_REF_NAME}:refs/codex-release/remote-tag"
+
+          source_commit="$(git rev-parse --verify "${RELEASE_SOURCE_COMMIT}^{commit}")"
+          checkout_commit="$(git rev-parse --verify 'HEAD^{commit}')"
+          tag_commit="$(git rev-parse --verify 'refs/codex-release/remote-tag^{commit}')"
+
+          if [[ "$checkout_commit" != "$source_commit" ]]; then
+            echo "::error::Checked-out commit $checkout_commit does not match release source commit $source_commit."
+            exit 1
+          fi
+          if [[ "$tag_commit" != "$source_commit" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME moved to $tag_commit; expected $source_commit."
+            exit 1
+          fi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install Rust ${{ env.RUST_VERSION }}
+        run: |
+          rustup toolchain install "${{ env.RUST_VERSION }}" --profile minimal --component rustfmt,clippy
+          rustup default "${{ env.RUST_VERSION }}"
+          rustc --version
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: ". -> target"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Audit frontend dependencies
+        run: npm audit --audit-level=high --registry=https://registry.npmjs.org
+
+      - name: Check frontend formatting
+        run: npm run format:check
+
+      - name: Lint frontend
+        run: npm run lint
+
+      - name: Run frontend tests
+        run: npm test
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Install RustSec cargo-audit
+        uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
+        with:
+          tool: cargo-audit@0.22.2
+          checksum: true
+          fallback: none
+
+      - name: Audit Rust dependencies
+        run: cargo audit
+
+      - name: Run workspace tests
+        run: cargo test --locked --workspace --all-targets
+
+      - name: Run Clippy
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+
+      - name: Build native Tauri application without bundling
+        run: npm run tauri build -- --no-bundle
+
+      - name: Build scheduled CLI
+        run: cargo build --locked --release --package codex-queue-demo
+
+      - name: Validate macOS scheduler scripts
+        run: |
+          zsh -n scripts/install-macos.sh scripts/uninstall-macos.sh scripts/tests/test-scheduler.zsh
+          zsh scripts/tests/test-scheduler.zsh
+          ./scripts/install-macos.sh --dry-run --queue demo/queue.json --codex-bin /usr/bin/true >/dev/null
+
+  windows-scheduler-quality:
+    name: Windows workspace and scheduler quality
+    needs: validate-release
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify release tag still targets the source commit
+        env:
+          RELEASE_SOURCE_COMMIT: ${{ needs.validate-release.outputs.source_commit }}
+        shell: bash
+        run: |
+          git fetch --no-tags --force origin \
+            "+refs/tags/${GITHUB_REF_NAME}:refs/codex-release/remote-tag"
+
+          source_commit="$(git rev-parse --verify "${RELEASE_SOURCE_COMMIT}^{commit}")"
+          checkout_commit="$(git rev-parse --verify 'HEAD^{commit}')"
+          tag_commit="$(git rev-parse --verify 'refs/codex-release/remote-tag^{commit}')"
+
+          if [[ "$checkout_commit" != "$source_commit" ]]; then
+            echo "::error::Checked-out commit $checkout_commit does not match release source commit $source_commit."
+            exit 1
+          fi
+          if [[ "$tag_commit" != "$source_commit" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME moved to $tag_commit; expected $source_commit."
+            exit 1
+          fi
+
+      - name: Install Rust ${{ env.RUST_VERSION }}
+        run: |
+          rustup toolchain install "${{ env.RUST_VERSION }}" --profile minimal
+          rustup default "${{ env.RUST_VERSION }}"
+          rustc --version
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: ". -> target"
+
+      - name: Run workspace tests
+        run: cargo test --locked --workspace --all-targets
+
+      - name: Build scheduled CLI
+        run: cargo build --locked --release --package codex-queue-demo
+
+      - name: Parse and dry-run Windows scheduler scripts
+        shell: pwsh
+        run: |
+          $allErrors = @()
+          Get-ChildItem -LiteralPath scripts -Filter '*.ps1' -Recurse | ForEach-Object {
+            $tokens = $null
+            $parseErrors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              $_.FullName,
+              [ref]$tokens,
+              [ref]$parseErrors
+            ) | Out-Null
+            $allErrors += $parseErrors
+          }
+
+          if ($allErrors.Count -gt 0) {
+            $allErrors | ForEach-Object {
+              Write-Host "::error file=$($_.Extent.File),line=$($_.Extent.StartLineNumber)::$($_.Message)"
+            }
+            exit 1
+          }
+
+          powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\scripts\tests\test-scheduler.ps1
+          ./scripts/install-windows.ps1 -WhatIf -CodexBin "$env:SystemRoot\System32\cmd.exe"
+
+  build-release:
+    name: Build / ${{ matrix.label }}
+    needs: [validate-release, quality-gate, windows-scheduler-quality]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+          - label: macOS Apple Silicon
+            os: macos-15
+            platform: macos
+            target: aarch64-apple-darwin
+            asset-suffix: macos-aarch64
+          - label: macOS Intel
+            os: macos-15-intel
+            platform: macos
+            target: x86_64-apple-darwin
+            asset-suffix: macos-x86_64
+          - label: Windows x64
+            os: windows-latest
+            platform: windows
+            target: x86_64-pc-windows-msvc
+            asset-suffix: windows-x86_64
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify release tag still targets the source commit
+        env:
+          RELEASE_SOURCE_COMMIT: ${{ needs.validate-release.outputs.source_commit }}
+        shell: bash
+        run: |
+          git fetch --no-tags --force origin \
+            "+refs/tags/${GITHUB_REF_NAME}:refs/codex-release/remote-tag"
+
+          source_commit="$(git rev-parse --verify "${RELEASE_SOURCE_COMMIT}^{commit}")"
+          checkout_commit="$(git rev-parse --verify 'HEAD^{commit}')"
+          tag_commit="$(git rev-parse --verify 'refs/codex-release/remote-tag^{commit}')"
+
+          if [[ "$checkout_commit" != "$source_commit" ]]; then
+            echo "::error::Checked-out commit $checkout_commit does not match release source commit $source_commit."
+            exit 1
+          fi
+          if [[ "$tag_commit" != "$source_commit" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME moved to $tag_commit; expected $source_commit."
+            exit 1
+          fi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install Rust ${{ env.RUST_VERSION }} target
+        run: |
+          rustup toolchain install "${{ env.RUST_VERSION }}" --profile minimal --target "${{ matrix.target }}"
+          rustup default "${{ env.RUST_VERSION }}"
+          rustc --version
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: ". -> target"
+          key: ${{ matrix.target }}
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build native installer bundles
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ runner.os == 'macOS' && '-' || '' }}
+        run: npm run tauri build -- --target "${{ matrix.target }}"
+
+      - name: Build scheduled CLI
+        run: cargo build --locked --release --package codex-queue-demo --target "${{ matrix.target }}"
+
+      - name: Stage macOS release assets
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          shopt -s nullglob
+          bundle_dir="target/${{ matrix.target }}/release/bundle/dmg"
+          dmg_files=("$bundle_dir"/*.dmg)
+          if [[ "${#dmg_files[@]}" -ne 1 ]]; then
+            echo "::error::Expected exactly one DMG in $bundle_dir, found ${#dmg_files[@]}."
+            find "target/${{ matrix.target }}/release/bundle" -maxdepth 3 -type f -print || true
+            exit 1
+          fi
+
+          binary="target/${{ matrix.target }}/release/codex-queue-demo"
+          [[ -x "$binary" ]] || {
+            echo "::error::Scheduled CLI was not built at $binary."
+            exit 1
+          }
+
+          mkdir -p release-assets scheduler-package
+          cp "${dmg_files[0]}" "release-assets/codex-queue-${GITHUB_REF_NAME}-${{ matrix.asset-suffix }}.dmg"
+          cp "$binary" scheduler-package/codex-queue-demo
+          cp scripts/install-macos.sh scripts/uninstall-macos.sh LICENSE scheduler-package/
+          chmod +x scheduler-package/codex-queue-demo scheduler-package/*.sh
+          (
+            cd scheduler-package
+            /usr/bin/zip -r -X "../release-assets/codex-queue-scheduler-${GITHUB_REF_NAME}-${{ matrix.asset-suffix }}.zip" .
+          )
+
+      - name: Stage Windows release assets
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $bundleRoot = "target/${{ matrix.target }}/release/bundle"
+          $msiFiles = @(Get-ChildItem -Path "$bundleRoot/msi/*.msi" -File)
+          $nsisFiles = @(Get-ChildItem -Path "$bundleRoot/nsis/*-setup.exe" -File)
+
+          if ($msiFiles.Count -ne 1) {
+            Write-Host "::error::Expected exactly one MSI in $bundleRoot/msi, found $($msiFiles.Count)."
+            Get-ChildItem -Path $bundleRoot -Recurse -File | ForEach-Object { Write-Host $_.FullName }
+            exit 1
+          }
+          if ($nsisFiles.Count -ne 1) {
+            Write-Host "::error::Expected exactly one NSIS installer in $bundleRoot/nsis, found $($nsisFiles.Count)."
+            Get-ChildItem -Path $bundleRoot -Recurse -File | ForEach-Object { Write-Host $_.FullName }
+            exit 1
+          }
+
+          $binary = "target/${{ matrix.target }}/release/codex-queue-demo.exe"
+          if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
+            Write-Host "::error::Scheduled CLI was not built at $binary."
+            exit 1
+          }
+
+          New-Item -ItemType Directory -Path release-assets, scheduler-package -Force | Out-Null
+          Copy-Item -LiteralPath $msiFiles[0].FullName -Destination "release-assets/codex-queue-$env:GITHUB_REF_NAME-${{ matrix.asset-suffix }}.msi"
+          Copy-Item -LiteralPath $nsisFiles[0].FullName -Destination "release-assets/codex-queue-$env:GITHUB_REF_NAME-${{ matrix.asset-suffix }}-setup.exe"
+          Copy-Item -LiteralPath $binary -Destination scheduler-package/codex-queue-demo.exe
+          Copy-Item -LiteralPath scripts/install-windows.ps1, scripts/uninstall-windows.ps1, LICENSE -Destination scheduler-package/
+          Compress-Archive -Path scheduler-package/* -DestinationPath "release-assets/codex-queue-scheduler-$env:GITHUB_REF_NAME-${{ matrix.asset-suffix }}.zip"
+
+      - name: Upload staged release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.asset-suffix }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  publish-release:
+    name: Verify and publish release
+    needs: [validate-release, build-release]
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate-release.outputs.source_commit }}
+          persist-credentials: false
+
+      - name: Download release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify expected assets and generate checksums
+        shell: bash
+        run: |
+          expected=(
+            "release-assets/codex-queue-${GITHUB_REF_NAME}-macos-aarch64.dmg"
+            "release-assets/codex-queue-${GITHUB_REF_NAME}-macos-x86_64.dmg"
+            "release-assets/codex-queue-${GITHUB_REF_NAME}-windows-x86_64.msi"
+            "release-assets/codex-queue-${GITHUB_REF_NAME}-windows-x86_64-setup.exe"
+            "release-assets/codex-queue-scheduler-${GITHUB_REF_NAME}-macos-aarch64.zip"
+            "release-assets/codex-queue-scheduler-${GITHUB_REF_NAME}-macos-x86_64.zip"
+            "release-assets/codex-queue-scheduler-${GITHUB_REF_NAME}-windows-x86_64.zip"
+          )
+
+          for asset in "${expected[@]}"; do
+            [[ -s "$asset" ]] || {
+              echo "::error::Missing or empty release asset: $asset"
+              exit 1
+            }
+          done
+
+          actual_count="$(find release-assets -maxdepth 1 -type f | wc -l | tr -d ' ')"
+          if [[ "$actual_count" -ne "${#expected[@]}" ]]; then
+            echo "::error::Expected ${#expected[@]} release assets, found $actual_count."
+            find release-assets -maxdepth 1 -type f -print
+            exit 1
+          fi
+
+          sha256sum "${expected[@]}" | sed 's#  release-assets/#  #' > release-assets/SHA256SUMS
+          (cd release-assets && sha256sum --check SHA256SUMS)
+
+      - name: Create, verify, and publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_SOURCE_COMMIT: ${{ needs.validate-release.outputs.source_commit }}
+        shell: bash
+        run: |
+          tag="$GITHUB_REF_NAME"
+          assets=(release-assets/*)
+          notes_file="$RUNNER_TEMP/release-notes.md"
+          cat > "$notes_file" <<'EOF'
+          Download the desktop installer and optional scheduler package for your platform below.
+
+          Scheduler ZIP files contain the prebuilt CLI and the matching install/uninstall scripts. Verify downloads with `SHA256SUMS` before installing.
+
+          These demo packages are not signed with a trusted Windows or Apple Developer certificate. See the README for platform security prompts and limitations.
+          EOF
+
+          git fetch --no-tags --force origin \
+            "+refs/tags/${tag}:refs/codex-release/remote-tag"
+          source_commit="$(git rev-parse --verify "${RELEASE_SOURCE_COMMIT}^{commit}")"
+          checkout_commit="$(git rev-parse --verify 'HEAD^{commit}')"
+          tag_commit="$(git rev-parse --verify 'refs/codex-release/remote-tag^{commit}')"
+
+          if [[ "$checkout_commit" != "$source_commit" ]]; then
+            echo "::error::Checked-out commit $checkout_commit does not match release source commit $source_commit."
+            exit 1
+          fi
+          if [[ "$tag_commit" != "$source_commit" ]]; then
+            echo "::error::Tag $tag moved to $tag_commit; refusing to publish artifacts built from $source_commit."
+            exit 1
+          fi
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft >/dev/null 2>&1; then
+            is_draft="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)"
+            if [[ "$is_draft" != "true" ]]; then
+              echo "::error::Release $tag already exists and is published; refusing to overwrite it."
+              exit 1
+            fi
+            gh release upload "$tag" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            create_args=(
+              --repo "$GITHUB_REPOSITORY"
+              --draft
+              --verify-tag
+              --generate-notes
+              --title "Codex Queue $tag"
+              --notes-file "$notes_file"
+            )
+            if [[ "$tag" == *-* ]]; then
+              create_args+=(--prerelease)
+            fi
+            gh release create "$tag" "${assets[@]}" "${create_args[@]}"
+          fi
+
+          for asset in "${assets[@]}"; do
+            basename "$asset"
+          done | LC_ALL=C sort > "$RUNNER_TEMP/expected-assets.txt"
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' \
+            | LC_ALL=C sort > "$RUNNER_TEMP/remote-assets.txt"
+          if ! diff -u "$RUNNER_TEMP/expected-assets.txt" "$RUNNER_TEMP/remote-assets.txt"; then
+            echo "::error::Draft release assets do not exactly match the verified build outputs."
+            exit 1
+          fi
+
+          git fetch --no-tags --force origin \
+            "+refs/tags/${tag}:refs/codex-release/remote-tag"
+          source_commit="$(git rev-parse --verify "${RELEASE_SOURCE_COMMIT}^{commit}")"
+          tag_commit="$(git rev-parse --verify 'refs/codex-release/remote-tag^{commit}')"
+          if [[ "$tag_commit" != "$source_commit" ]]; then
+            echo "::error::Tag $tag moved to $tag_commit before publication; refusing to publish artifacts built from $source_commit."
+            exit 1
+          fi
+
+          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false

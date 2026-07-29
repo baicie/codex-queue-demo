@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use codex_queue_demo::{CodexCli, QueueRunner, Task, TaskStatus, TransientTaskError};
@@ -81,6 +83,93 @@ fn distinguishes_transient_api_failures_from_authentication_failures() {
 }
 
 #[test]
+fn classifies_early_transient_failure_before_stdin_broken_pipe() {
+    let temp = TempDir::new().expect("temp directory");
+    let fake_codex = compile_fake_codex(temp.path());
+    let workspace = temp.path().join("workspace");
+    let run_directory = temp.path().join("early-transient-run");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&run_directory).unwrap();
+    let mut codex = CodexCli::new(fake_codex);
+    let large_prompt = "large prompt content ".repeat(100_000);
+
+    let error = codex
+        .execute_task(&task(&large_prompt), &workspace, &run_directory)
+        .expect_err("an early HTTP 503 should fail transiently");
+
+    assert!(
+        error.downcast_ref::<TransientTaskError>().is_some(),
+        "HTTP 503 should not be hidden by a stdin write failure: {error:#}"
+    );
+    assert!(
+        fs::read_to_string(run_directory.join("stderr.log"))
+            .unwrap()
+            .contains("HTTP 503 service unavailable")
+    );
+}
+
+#[test]
+fn times_out_hanging_codex_and_terminates_its_process_tree() {
+    let temp = TempDir::new().expect("temp directory");
+    let fake_codex = compile_fake_codex(temp.path());
+    let workspace = temp.path().join("workspace");
+    let run_directory = temp.path().join("timeout-run");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&run_directory).unwrap();
+    let mut codex = CodexCli::with_timeout(fake_codex, Duration::from_secs(5));
+    let hanging_prompt = "HANGING_INPUT".repeat(100_000);
+
+    let started = Instant::now();
+    let error = codex
+        .execute_task(&task(&hanging_prompt), &workspace, &run_directory)
+        .expect_err("a hanging Codex process should time out");
+
+    assert!(
+        started.elapsed() < Duration::from_secs(7),
+        "timeout should stop the child promptly"
+    );
+    assert!(error.downcast_ref::<TransientTaskError>().is_some());
+    assert!(error.to_string().contains("timed out"));
+    let events = fs::read_to_string(run_directory.join("events.jsonl")).unwrap();
+    let stderr = fs::read_to_string(run_directory.join("stderr.log")).unwrap();
+    assert!(
+        events.contains("partial output before timeout"),
+        "partial stdout was not preserved: {events:?}"
+    );
+    assert!(
+        stderr.contains("partial stderr before timeout"),
+        "partial stderr was not preserved: {stderr:?}"
+    );
+
+    thread::sleep(Duration::from_secs(4));
+    assert!(
+        !run_directory.join("finished-after-hang.txt").exists(),
+        "the timed-out process tree should be terminated, not left running"
+    );
+}
+
+#[test]
+fn successful_codex_terminates_its_remaining_process_tree() {
+    let temp = TempDir::new().expect("temp directory");
+    let fake_codex = compile_fake_codex(temp.path());
+    let workspace = temp.path().join("workspace");
+    let run_directory = temp.path().join("success-with-descendant-run");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&run_directory).unwrap();
+    let mut codex = CodexCli::new(fake_codex);
+
+    codex
+        .execute_task(&task("SPAWN_DESCENDANT"), &workspace, &run_directory)
+        .expect("the parent Codex process succeeds");
+
+    thread::sleep(Duration::from_secs(2));
+    assert!(
+        !run_directory.join("finished-after-success.txt").exists(),
+        "a successful parent must not leave its process tree running"
+    );
+}
+
+#[test]
 #[cfg(not(target_os = "macos"))]
 fn opens_the_codex_app_for_the_requested_workspace() {
     let temp = TempDir::new().expect("temp directory");
@@ -113,6 +202,7 @@ fn task(prompt: &str) -> Task {
         started_at: None,
         finished_at: None,
         last_error: None,
+        blocked_reason: None,
         next_retry_at: None,
     }
 }
@@ -125,11 +215,23 @@ fn compile_fake_codex(directory: &Path) -> PathBuf {
         r#"
 use std::env;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
+use std::thread;
+use std::time::Duration;
 
 fn main() {
     let args = env::args().skip(1).collect::<Vec<_>>();
+    if args.first().map(String::as_str) == Some("DESCENDANT_AFTER_TIMEOUT") {
+        thread::sleep(Duration::from_secs(8));
+        fs::write(&args[1], "finished\n").unwrap();
+        return;
+    }
+    if args.first().map(String::as_str) == Some("DESCENDANT_AFTER_SUCCESS") {
+        thread::sleep(Duration::from_secs(1));
+        fs::write(&args[1], "finished\n").unwrap();
+        return;
+    }
     if args.first().map(String::as_str) == Some("app") {
         let workspace = PathBuf::from(&args[1]);
         fs::write(workspace.join("app-launched.txt"), "launched\n").unwrap();
@@ -139,6 +241,26 @@ fn main() {
     let output_index = args.iter().position(|arg| arg == "-o").unwrap() + 1;
     let final_path = PathBuf::from(&args[output_index]);
     let run_directory = final_path.parent().unwrap();
+    if run_directory.file_name().and_then(|name| name.to_str()) == Some("early-transient-run") {
+        eprintln!("HTTP 503 service unavailable");
+        io::stderr().flush().unwrap();
+        std::process::exit(1);
+    }
+    if run_directory.file_name().and_then(|name| name.to_str()) == Some("timeout-run") {
+        println!("{{\"type\":\"turn.started\",\"message\":\"partial output before timeout\"}}");
+        io::stdout().flush().unwrap();
+        eprintln!("partial stderr before timeout");
+        io::stderr().flush().unwrap();
+        let marker = run_directory.join("finished-after-hang.txt");
+        let mut descendant = std::process::Command::new(env::current_exe().unwrap())
+            .arg("DESCENDANT_AFTER_TIMEOUT")
+            .arg(marker)
+            .spawn()
+            .unwrap();
+        thread::sleep(Duration::from_secs(30));
+        let _ = descendant.wait();
+        unreachable!("the fake Codex wrapper should have been terminated");
+    }
     let mut prompt = String::new();
     io::stdin().read_to_string(&mut prompt).unwrap();
     fs::write(run_directory.join("args.txt"), format!("{}\n", args.join("\n"))).unwrap();
@@ -150,6 +272,13 @@ fn main() {
     if prompt.contains("PERMANENT_API_FAILURE") {
         eprintln!("HTTP 401 invalid authentication");
         std::process::exit(1);
+    }
+    if prompt.contains("SPAWN_DESCENDANT") {
+        std::process::Command::new(env::current_exe().unwrap())
+            .arg("DESCENDANT_AFTER_SUCCESS")
+            .arg(run_directory.join("finished-after-success.txt"))
+            .spawn()
+            .unwrap();
     }
     fs::write(final_path, "FAKE_CODEX_OK\n").unwrap();
     println!("{{\"type\":\"completed\"}}");

@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 use codex_queue_demo::{
-    QueueRunner, RunSummary, TransientTaskError, WorkerOptions, parse_queue, run_queue_file,
+    BlockedReasonCode, QueueRunner, RunSummary, TransientTaskError, WorkerOptions, parse_queue,
+    run_queue_file,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -87,6 +88,28 @@ fn continues_independent_work_and_blocks_children_after_failure() {
     assert_eq!(status(&persisted, "independent"), "succeeded");
     assert_eq!(status(&persisted, "parent"), "failed");
     assert_eq!(status(&persisted, "child"), "blocked");
+    let blocked_child = persisted
+        .tasks
+        .iter()
+        .find(|task| task.id == "child")
+        .expect("blocked child");
+    assert_eq!(
+        blocked_child
+            .blocked_reason
+            .as_ref()
+            .expect("structured blocked reason")
+            .reason_code,
+        BlockedReasonCode::DependencyUnavailable
+    );
+    assert_eq!(
+        blocked_child
+            .blocked_reason
+            .as_ref()
+            .expect("structured blocked reason")
+            .dependency_id,
+        "parent"
+    );
+    assert!(blocked_child.last_error.is_none());
     assert!(
         persisted
             .tasks
