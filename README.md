@@ -252,7 +252,14 @@ gh secret set APPLE_TEAM_ID
 
 Apple notarization 需要付费 Apple Developer Program 账号；免费账号只能用于开发测试。证书准备和环境变量定义参见 [Tauri macOS signing](https://v2.tauri.app/distribute/sign/macos/) 与 [Tauri environment variables](https://v2.tauri.app/reference/environment-variables/)。
 
-历史版本 `v0.2.2` 使用 ad-hoc 签名且没有 notarization。其校验和正确时，可先尝试打开一次，再到“系统设置 > 隐私与安全性 > 安全性”选择“仍要打开”进行一次性授权；该操作只适合已核验来源的历史包，不是发布修复。
+历史版本 `v0.2.2` 使用 ad-hoc 签名且没有 notarization。其校验和正确时，可先尝试打开一次，再到“系统设置 > 隐私与安全性 > 安全性”选择“仍要打开”进行一次性授权。也可以对已核验来源的本地副本执行：
+
+```bash
+xattr -dr com.apple.quarantine "/Applications/Codex Queue.app"
+open -b io.github.baicie.codex-queue
+```
+
+`xattr -dr` 会递归移除该 app 的 quarantine 属性，相当于绕过这一副本的 Gatekeeper 隔离。只应对已核对 Release 校验和的历史包使用；它不是正式的签名或发布修复。
 
 Windows 安装包目前仍未签名，Microsoft Defender SmartScreen 可能显示未知发布者警告。请只运行从本仓库 Release 获取并核对版本的文件。参见 [Tauri Windows signing](https://v2.tauri.app/distribute/sign/windows/)。
 
