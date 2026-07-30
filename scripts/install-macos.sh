@@ -129,6 +129,12 @@ if [[ -n "$NODE_BINARY" ]]; then
 fi
 LAUNCH_PATH="$LAUNCH_PATH:${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
 
+if ! /usr/bin/env PATH="$LAUNCH_PATH" "$CODEX_BINARY" --version >/dev/null 2>&1; then
+  print -u2 "Codex CLI could not run with the scheduler PATH: $CODEX_BINARY"
+  print -u2 "Install a standalone Codex CLI or pass --codex-bin with its interpreter available."
+  exit 1
+fi
+
 if $DRY_RUN; then
   if [[ -n "$OUTPUT_PLIST" ]]; then
     mkdir -p "$(dirname "$OUTPUT_PLIST")"

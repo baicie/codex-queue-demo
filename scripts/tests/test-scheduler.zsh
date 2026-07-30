@@ -38,6 +38,7 @@ FAKE_NODE_DIRECTORY="$TEMP_DIRECTORY/node-bin"
 FAKE_FAILURE_DIRECTORY="$TEMP_DIRECTORY/failure-bin"
 FAKE_CONCURRENT_DIRECTORY="$TEMP_DIRECTORY/concurrent-bin"
 FAKE_SYMLINK_DIRECTORY="$TEMP_DIRECTORY/symlink-bin"
+BROKEN_CODEX_DIRECTORY="$TEMP_DIRECTORY/broken-codex-bin"
 TEST_HOME="$TEMP_DIRECTORY/home"
 APP_DATA_DIRECTORY="$TEST_HOME/Library/Application Support/io.github.baicie.codex-queue"
 DEFAULT_QUEUE="$APP_DATA_DIRECTORY/queue.json"
@@ -51,6 +52,7 @@ mkdir -p \
   "$FAKE_FAILURE_DIRECTORY" \
   "$FAKE_CONCURRENT_DIRECTORY" \
   "$FAKE_SYMLINK_DIRECTORY" \
+  "$BROKEN_CODEX_DIRECTORY" \
   "$APP_DATA_DIRECTORY"
 cp "$REPOSITORY_ROOT/scripts/install-macos.sh" "$PACKAGE_DIRECTORY/install-macos.sh"
 cp "$REPOSITORY_ROOT/scripts/uninstall-macos.sh" "$PACKAGE_DIRECTORY/uninstall-macos.sh"
@@ -85,6 +87,7 @@ print '#!/bin/zsh
 /bin/ln -s "$1" "$2"
 exit 1' > "$FAKE_SYMLINK_DIRECTORY/ln"
 print '#!/bin/zsh\nexit 0' > "$EXPLICIT_CLI"
+print '#!/bin/zsh\nexit 23' > "$BROKEN_CODEX_DIRECTORY/codex"
 chmod +x \
   "$PACKAGE_DIRECTORY/codex-queue-demo" \
   "$PACKAGE_DIRECTORY/install-macos.sh" \
@@ -95,10 +98,24 @@ chmod +x \
   "$FAKE_FAILURE_DIRECTORY/ln" \
   "$FAKE_CONCURRENT_DIRECTORY/ln" \
   "$FAKE_SYMLINK_DIRECTORY/ln" \
+  "$BROKEN_CODEX_DIRECTORY/codex" \
   "$EXPLICIT_CLI"
 
 print '{"version":1,"launchApp":true,"retryPolicy":{"maxAttempts":4,"initialDelaySeconds":30,"maxDelaySeconds":900},"tasks":[]}' > "$DEFAULT_QUEUE"
 cp "$DEFAULT_QUEUE" "$EXPLICIT_QUEUE"
+
+BROKEN_CODEX_STDERR="$TEMP_DIRECTORY/broken-codex.stderr"
+if HOME="$TEST_HOME" PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+  "$PACKAGE_DIRECTORY/install-macos.sh" \
+  --dry-run \
+  --output-plist "$TEMP_DIRECTORY/broken-codex.plist" \
+  --codex-bin "$BROKEN_CODEX_DIRECTORY/codex" >/dev/null 2>"$BROKEN_CODEX_STDERR"; then
+  fail "installer should reject a Codex CLI that cannot run"
+fi
+assert_file_contains \
+  "Codex CLI could not run with the scheduler PATH" \
+  "$BROKEN_CODEX_STDERR" \
+  "unrunnable Codex rejection should explain the scheduler environment"
 
 DEFAULT_PLIST="$TEMP_DIRECTORY/default.plist"
 HOME="$TEST_HOME" PATH="$FAKE_NODE_DIRECTORY:$FAKE_BIN_DIRECTORY:/usr/bin:/bin:/usr/sbin:/sbin" \
@@ -248,6 +265,9 @@ assert_file_contains '[Environment+SpecialFolder]::ApplicationData' "$REPOSITORY
 assert_file_contains "AppIdentifier = 'io.github.baicie.codex-queue'" "$REPOSITORY_ROOT/scripts/install-windows.ps1" "Windows installer should use the Tauri app identifier"
 assert_file_contains "\$QueuePath = Join-Path \$appDataDirectory 'queue.json'" "$REPOSITORY_ROOT/scripts/install-windows.ps1" "Windows default queue should match Tauri app_data_dir/queue.json"
 assert_file_contains '[string]$CliBin' "$REPOSITORY_ROOT/scripts/install-windows.ps1" "Windows installer should accept an explicit CLI path"
+assert_file_contains 'Test-CodexCli -Path $codexPath -LaunchPath $launchPath' "$REPOSITORY_ROOT/scripts/install-windows.ps1" "Windows installer should verify Codex with the scheduled PATH"
+assert_file_contains '$failure = "exit code $LASTEXITCODE"' "$REPOSITORY_ROOT/scripts/install-windows.ps1" "Windows Codex preflight should use valid PowerShell strings"
+assert_file_contains 'throw "Codex CLI could not run with the scheduler PATH: $Path ($failure)"' "$REPOSITORY_ROOT/scripts/install-windows.ps1" "Windows Codex preflight should expose an actionable error"
 assert_file_contains 'ExportTaskXml' "$REPOSITORY_ROOT/scripts/install-windows.ps1" "Windows installer should support verifiable task XML generation"
 assert_file_contains '01:00' "$REPOSITORY_ROOT/scripts/install-windows.ps1" "Windows schedule should remain at 01:00"
 assert_file_contains "SetAttribute('version', '1.3')" "$REPOSITORY_ROOT/scripts/install-windows.ps1" "Windows task XML should use the version fixed by the official schema"

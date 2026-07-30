@@ -182,7 +182,7 @@ export const en = {
       maxDelay: "Maximum delay",
       seconds: "seconds",
       codexBin: "Codex CLI path",
-      codexBinPlaceholder: "Leave empty to use codex from PATH",
+      codexBinPlaceholder: "Leave empty to detect Codex CLI automatically",
       validation: {
         maxAttempts: "Maximum attempts must be an integer from 1 to 20",
         initialDelay: "Initial delay must be a positive integer",

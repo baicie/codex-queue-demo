@@ -53,7 +53,7 @@ React + Vite + shadcn/ui
 
 ## 环境要求
 
-- 运行桌面应用或 scheduler：已登录且可从 `PATH` 调用的 Codex CLI。
+- 运行桌面应用或 scheduler：已安装并登录的 Codex CLI。桌面端会自动检查显式设置、`CODEX_BIN`、`PATH` 和平台默认安装位置。
 - 当队列设置 `launchApp: true` 时，当前用户需要安装 Codex Desktop。
 - 从源码开发：Node.js 24、npm 和 Rust 1.88；crate 清单和 CI 均固定使用这个 MSRV。
 - macOS 需要 Xcode Command Line Tools；Windows 11 需要 Microsoft C++ Build Tools 和 WebView2。完整平台依赖参见 [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/)。
@@ -122,7 +122,7 @@ Windows 11 实际执行：
 .\target\release\codex-queue-demo.exe run --queue .\demo\queue.json
 ```
 
-如果后台任务的 `PATH` 中没有 `codex`，设置 `CODEX_BIN` 或传入 `--codex-bin`。调度器安装脚本会解析并保存 Codex CLI 的绝对路径，因为后台任务不会继承交互式 shell 配置。
+实际执行前会运行一次 `codex --version`，确认 CLI 及其解释器可用；检查失败不会修改队列或增加任务尝试次数。默认发现位置包括 macOS 的 `~/.local/bin/codex`、Codex/ChatGPT 应用内置 CLI，以及 Windows 的 `%LOCALAPPDATA%\Programs\OpenAI\Codex\bin\codex.exe`。也可以在队列设置中填写绝对路径，或通过 `CODEX_BIN` / `--codex-bin` 指定。后台进程不会继承交互式 shell 配置，因此仅指向 npm wrapper 还不够，其 `node` 解释器也必须位于运行环境的 `PATH` 中。参见 [Codex CLI 安装](https://learn.chatgpt.com/docs/codex/cli) 和 [Codex 环境变量](https://learn.chatgpt.com/docs/config-file/environment-variables)。
 
 ## 每日 01:00 调度
 
@@ -203,8 +203,8 @@ Windows 11 Task Scheduler：
 推送与应用版本一致的 `v*` tag 会触发 `.github/workflows/release.yml`：
 
 ```bash
-git tag v0.2.1
-git push origin v0.2.1
+git tag v0.2.2
+git push origin v0.2.2
 ```
 
 Release workflow 只接受位于 `main` 历史上的 tag，并在任何发布构建开始前重新执行完整的前端、Rust 和调度脚本质量门。质量门通过后会生成：
