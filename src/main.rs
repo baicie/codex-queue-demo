@@ -28,7 +28,7 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
 
-        /// Codex CLI executable. Defaults to CODEX_BIN, codex, or codex.cmd.
+        /// Codex CLI executable. Defaults to CODEX_BIN, PATH, or the platform install location.
         #[arg(long)]
         codex_bin: Option<OsString>,
     },
@@ -51,7 +51,11 @@ fn execute(cli: Cli) -> anyhow::Result<u8> {
             dry_run,
             codex_bin,
         } => {
-            let mut codex = codex_bin.map_or_else(CodexCli::default, CodexCli::new);
+            let mut codex = if dry_run {
+                codex_bin.map_or_else(CodexCli::default, CodexCli::new)
+            } else {
+                CodexCli::discover(codex_bin)?
+            };
             let summary = run_queue_file(&queue, WorkerOptions { dry_run }, &mut codex)?;
             print_summary(&summary, dry_run);
 

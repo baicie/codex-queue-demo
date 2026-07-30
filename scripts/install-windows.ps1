@@ -109,6 +109,41 @@ function Write-Utf8WithoutBom {
     [System.IO.File]::WriteAllText($Path, $Content, $encoding)
 }
 
+function Test-CodexCli {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$LaunchPath
+    )
+
+    $originalPath = $env:PATH
+    $failure = $null
+    try {
+        if ([string]::IsNullOrWhiteSpace($originalPath)) {
+            $env:PATH = $LaunchPath
+        }
+        else {
+            $env:PATH = $LaunchPath + [System.IO.Path]::PathSeparator + $originalPath
+        }
+
+        try {
+            & $Path --version *> $null
+            if ($LASTEXITCODE -ne 0) {
+                $failure = "exit code $LASTEXITCODE"
+            }
+        }
+        catch {
+            $failure = $_.Exception.Message
+        }
+    }
+    finally {
+        $env:PATH = $originalPath
+    }
+
+    if ($null -ne $failure) {
+        throw "Codex CLI could not run with the scheduler PATH: $Path ($failure)"
+    }
+}
+
 function Get-PathEntryKind {
     param(
         [Parameter(Mandatory)][string]$Path
@@ -290,6 +325,8 @@ if ($null -ne $nodeCommand) {
     }
 }
 $launchPath = $pathEntries -join [System.IO.Path]::PathSeparator
+
+Test-CodexCli -Path $codexPath -LaunchPath $launchPath
 
 $escapedBinary = $installedBinary.Replace("'", "''")
 $escapedQueue = $queuePath.Replace("'", "''")

@@ -1,8 +1,8 @@
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -21,6 +21,7 @@ use crate::{QueueRunner, Task, TransientTaskError};
 // Four 45-minute attempts plus the default backoff fit below the scheduler's
 // four-hour Windows limit, while each attempt can still handle substantial work.
 const DEFAULT_EXECUTION_TIMEOUT: Duration = Duration::from_secs(45 * 60);
+const CLI_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 pub struct CodexCli {
@@ -40,19 +41,187 @@ impl CodexCli {
             execution_timeout,
         }
     }
+
+    /// Resolves and verifies the Codex CLI before a queue can mutate task state.
+    pub fn discover(explicit: Option<OsString>) -> Result<Self> {
+        let search_path = env::var_os("PATH");
+        let explicit = explicit
+            .filter(|value| !value.is_empty())
+            .or_else(|| env::var_os("CODEX_BIN").filter(|value| !value.is_empty()));
+        let binary = select_codex_binary(
+            explicit,
+            search_path.as_deref(),
+            &default_codex_candidates(),
+            probe_codex_binary,
+        )?;
+        Ok(Self::new(binary))
+    }
 }
 
 impl Default for CodexCli {
     fn default() -> Self {
-        let binary = env::var_os("CODEX_BIN").unwrap_or_else(|| {
-            if cfg!(windows) {
-                OsString::from("codex.cmd")
-            } else {
-                OsString::from("codex")
-            }
-        });
+        let search_path = env::var_os("PATH");
+        let binary = select_codex_binary(
+            env::var_os("CODEX_BIN"),
+            search_path.as_deref(),
+            &default_codex_candidates(),
+            |_| Ok(()),
+        )
+        .unwrap_or_else(|_| default_codex_command());
         Self::new(binary)
     }
+}
+
+fn select_codex_binary(
+    explicit: Option<OsString>,
+    search_path: Option<&OsStr>,
+    fallback_candidates: &[PathBuf],
+    mut probe: impl FnMut(&OsStr) -> Result<()>,
+) -> Result<OsString> {
+    if let Some(explicit) = explicit.filter(|value| !value.is_empty()) {
+        probe(&explicit)
+            .with_context(|| format!("Codex CLI is not runnable: {:?}", Path::new(&explicit)))?;
+        return Ok(explicit);
+    }
+
+    let mut candidates = find_codex_on_path(search_path);
+    candidates.extend(
+        fallback_candidates
+            .iter()
+            .filter(|candidate| is_executable_file(candidate))
+            .cloned(),
+    );
+    let mut last_failure = None;
+    for candidate in candidates {
+        match probe(candidate.as_os_str()) {
+            Ok(()) => return Ok(candidate.into_os_string()),
+            Err(error) => last_failure = Some((candidate, error)),
+        }
+    }
+
+    if let Some((candidate, error)) = last_failure {
+        bail!(
+            "Codex CLI is not runnable: {}: {error:#}. Choose a working CLI in queue settings",
+            candidate.display()
+        );
+    }
+    bail!(
+        "Codex CLI was not found. Install Codex CLI or set an absolute Codex CLI path in queue settings"
+    )
+}
+
+fn find_codex_on_path(search_path: Option<&OsStr>) -> Vec<PathBuf> {
+    let Some(search_path) = search_path else {
+        return Vec::new();
+    };
+    let mut candidates = Vec::new();
+    for directory in env::split_paths(search_path) {
+        for command in codex_command_names() {
+            let candidate = directory.join(command);
+            if is_executable_file(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+    }
+    candidates
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(windows)]
+    {
+        true
+    }
+}
+
+fn default_codex_command() -> OsString {
+    if cfg!(windows) {
+        OsString::from("codex.cmd")
+    } else {
+        OsString::from("codex")
+    }
+}
+
+fn probe_codex_binary(binary: &OsStr) -> Result<()> {
+    let mut command = Command::new(binary);
+    command
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let child = spawn_command_group(command)
+        .with_context(|| format!("failed to start {:?}", Path::new(binary)))?;
+    let mut child = SpawnedChildGuard::new(child);
+    let status = wait_for_exit(child.child_mut(), CLI_PROBE_TIMEOUT)
+        .context("failed while checking the Codex CLI")?;
+    let Some(status) = status else {
+        child
+            .terminate_and_reap()
+            .context("failed to stop the Codex CLI check")?;
+        bail!("Codex CLI check timed out after {CLI_PROBE_TIMEOUT:?}");
+    };
+    child
+        .terminate_and_reap()
+        .context("failed to clean up the Codex CLI check")?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("`codex --version` exited with status {status}")
+    }
+}
+
+#[cfg(windows)]
+fn codex_command_names() -> &'static [&'static str] {
+    &["codex.exe", "codex.cmd", "codex.bat"]
+}
+
+#[cfg(not(windows))]
+fn codex_command_names() -> &'static [&'static str] {
+    &["codex"]
+}
+
+fn default_codex_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = env::var_os("HOME").filter(|value| !value.is_empty()) {
+            let home = PathBuf::from(home);
+            candidates.push(home.join(".local/bin/codex"));
+            candidates.push(home.join("Applications/ChatGPT.app/Contents/Resources/codex"));
+            candidates.push(home.join("Applications/Codex.app/Contents/Resources/codex"));
+        }
+        candidates.push(PathBuf::from(
+            "/Applications/ChatGPT.app/Contents/Resources/codex",
+        ));
+        candidates.push(PathBuf::from(
+            "/Applications/Codex.app/Contents/Resources/codex",
+        ));
+    }
+
+    #[cfg(windows)]
+    if let Some(local_app_data) = env::var_os("LOCALAPPDATA").filter(|value| !value.is_empty()) {
+        candidates.push(
+            PathBuf::from(local_app_data)
+                .join("Programs/OpenAI/Codex/bin")
+                .join("codex.exe"),
+        );
+    }
+
+    candidates
 }
 
 impl QueueRunner for CodexCli {
@@ -268,10 +437,10 @@ impl ChildWrapper for SpawnCleanupChild {
 #[cfg(any(windows, test))]
 impl Drop for SpawnCleanupChild {
     fn drop(&mut self) {
-        if self.armed {
-            if let Some(child) = self.child.as_deref_mut() {
-                let _ = terminate_and_reap(child);
-            }
+        if self.armed
+            && let Some(child) = self.child.as_deref_mut()
+        {
+            let _ = terminate_and_reap(child);
         }
     }
 }
@@ -510,6 +679,152 @@ mod tests {
             ]
         );
     }
+}
+
+#[cfg(test)]
+mod binary_resolution_tests {
+    use std::env;
+    use std::fs;
+    use std::thread;
+    use std::time::Duration;
+
+    use tempfile::TempDir;
+
+    use super::{probe_codex_binary, select_codex_binary};
+
+    #[test]
+    fn finds_an_installed_cli_when_the_gui_path_has_no_codex() {
+        let temp = TempDir::new().expect("temp directory");
+        let binary = temp
+            .path()
+            .join(format!("codex{}", env::consts::EXE_SUFFIX));
+        fs::write(&binary, b"test binary").expect("fake Codex CLI");
+        make_executable(&binary);
+        let restricted_path =
+            env::join_paths([temp.path().join("missing")]).expect("restricted PATH");
+
+        let resolved = select_codex_binary(
+            None,
+            Some(&restricted_path),
+            std::slice::from_ref(&binary),
+            |candidate| {
+                (candidate == binary.as_os_str())
+                    .then_some(())
+                    .ok_or_else(|| anyhow::anyhow!("not runnable"))
+            },
+        )
+        .expect("fallback CLI should resolve");
+
+        assert_eq!(resolved, binary.into_os_string());
+    }
+
+    #[test]
+    fn skips_a_broken_path_cli_for_a_working_native_fallback() {
+        let temp = TempDir::new().expect("temp directory");
+        let path_directory = temp.path().join("path-bin");
+        fs::create_dir(&path_directory).expect("PATH directory");
+        let broken = path_directory.join(format!("codex{}", env::consts::EXE_SUFFIX));
+        let native = temp
+            .path()
+            .join(format!("native-codex{}", env::consts::EXE_SUFFIX));
+        fs::write(&broken, b"broken wrapper").expect("broken CLI");
+        fs::write(&native, b"native CLI").expect("native CLI");
+        make_executable(&broken);
+        make_executable(&native);
+        let search_path = env::join_paths([&path_directory]).expect("test PATH");
+
+        let resolved = select_codex_binary(
+            None,
+            Some(&search_path),
+            std::slice::from_ref(&native),
+            |candidate| {
+                (candidate == native.as_os_str())
+                    .then_some(())
+                    .ok_or_else(|| anyhow::anyhow!("missing interpreter"))
+            },
+        )
+        .expect("native fallback should resolve");
+
+        assert_eq!(resolved, native.into_os_string());
+    }
+
+    #[test]
+    fn reports_an_actionable_error_when_no_cli_is_available() {
+        let temp = TempDir::new().expect("temp directory");
+        let restricted_path =
+            env::join_paths([temp.path().join("missing")]).expect("restricted PATH");
+
+        let error = select_codex_binary(None, Some(&restricted_path), &[], |_| Ok(()))
+            .expect_err("missing CLI should fail before queue execution");
+
+        assert!(error.to_string().contains("Codex CLI was not found"));
+        assert!(error.to_string().contains("queue settings"));
+    }
+
+    #[test]
+    fn probe_terminates_descendants_after_the_cli_exits() {
+        let temp = TempDir::new().expect("temp directory");
+        let successful_binary = probe_with_delayed_descendant(&temp.path().join("successful"), 0);
+        let failing_binary = probe_with_delayed_descendant(&temp.path().join("failing"), 23);
+
+        probe_codex_binary(successful_binary.as_os_str())
+            .expect("successful parent CLI probe should succeed");
+        probe_codex_binary(failing_binary.as_os_str())
+            .expect_err("failing parent CLI probe should fail");
+
+        thread::sleep(Duration::from_secs(2));
+        for binary in [successful_binary, failing_binary] {
+            assert!(
+                !binary.with_extension("marker").exists(),
+                "the CLI probe left a descendant process running"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn probe_with_delayed_descendant(
+        directory: &std::path::Path,
+        exit_code: u8,
+    ) -> std::path::PathBuf {
+        fs::create_dir(directory).expect("fake CLI directory");
+        let binary = directory.join("codex");
+        fs::write(
+            &binary,
+            format!("#!/bin/sh\n(sleep 1; printf leaked > \"$0.marker\") &\nexit {exit_code}\n"),
+        )
+        .expect("fake Codex CLI");
+        make_executable(&binary);
+        binary
+    }
+
+    #[cfg(windows)]
+    fn probe_with_delayed_descendant(
+        directory: &std::path::Path,
+        exit_code: u8,
+    ) -> std::path::PathBuf {
+        fs::create_dir(directory).expect("fake CLI directory");
+        let binary = directory.join("codex.cmd");
+        fs::write(
+            &binary,
+            format!(
+                "@echo off\r\nstart \"\" /b cmd.exe /d /s /c \"ping.exe -n 2 127.0.0.1 >nul & echo leaked>\"\"%~dpn0.marker\"\"\"\r\nexit /b {exit_code}\r\n"
+            ),
+        )
+        .expect("fake Codex CLI");
+        binary
+    }
+
+    #[cfg(unix)]
+    fn make_executable(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(path).expect("fake CLI metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("executable fake CLI");
+    }
+
+    #[cfg(windows)]
+    fn make_executable(_path: &std::path::Path) {}
 }
 
 #[cfg(test)]

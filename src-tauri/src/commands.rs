@@ -95,7 +95,8 @@ pub async fn run_queue(
 
     let path = PathBuf::from(path);
     let task_result = tauri::async_runtime::spawn_blocking(move || {
-        let mut codex = codex_bin.map_or_else(CodexCli::default, CodexCli::new);
+        let mut codex =
+            CodexCli::discover(codex_bin.map(Into::into)).map_err(|error| error.to_string())?;
         run_queue_file(&path, WorkerOptions::default(), &mut codex)
             .map_err(|error| error.to_string())
     })

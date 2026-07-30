@@ -236,6 +236,7 @@ $tempDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ("codex-queue-sched
 try {
     $packageDirectory = Join-Path $tempDirectory 'release-package'
     $fakeCodexDirectory = Join-Path $tempDirectory 'npm-bin'
+    $brokenCodexDirectory = Join-Path $tempDirectory 'broken-codex-bin'
     $fakeNodeDirectory = Join-Path $tempDirectory 'node-bin'
     $queuePath = Join-Path $tempDirectory 'queue.json'
     $taskXmlPath = Join-Path $tempDirectory 'task.xml'
@@ -244,13 +245,24 @@ try {
     $defaultRunnerExportPath = Join-Path $tempDirectory 'default-run-queue.ps1'
     $packagedCli = Join-Path $packageDirectory 'codex-queue-demo.exe'
     $packagedInstaller = Join-Path $packageDirectory 'install-windows.ps1'
-    $codexPath = Join-Path $fakeCodexDirectory 'codex.cmd'
+    $codexFileName = if ($isWindowsPlatform) { 'codex.cmd' } else { 'codex' }
+    $codexPath = Join-Path $fakeCodexDirectory $codexFileName
+    $brokenCodexPath = Join-Path $brokenCodexDirectory $codexFileName
     $nodePath = Join-Path $fakeNodeDirectory 'node.exe'
 
-    [void](New-Item -ItemType Directory -Path $packageDirectory, $fakeCodexDirectory, $fakeNodeDirectory -Force)
+    [void](New-Item -ItemType Directory -Path $packageDirectory, $fakeCodexDirectory, $brokenCodexDirectory, $fakeNodeDirectory -Force)
     Copy-Item -LiteralPath (Join-Path $repositoryRoot 'scripts\install-windows.ps1') -Destination $packagedInstaller
     [System.IO.File]::WriteAllText($packagedCli, 'test executable')
-    [System.IO.File]::WriteAllText($codexPath, '@exit /b 0')
+    if ($isWindowsPlatform) {
+        [System.IO.File]::WriteAllText($codexPath, '@exit /b 0')
+        [System.IO.File]::WriteAllText($brokenCodexPath, '@exit /b 23')
+    }
+    else {
+        [System.IO.File]::WriteAllText($codexPath, "#!/bin/sh`nexit 0`n")
+        [System.IO.File]::WriteAllText($brokenCodexPath, "#!/bin/sh`nexit 23`n")
+        & chmod +x $codexPath
+        & chmod +x $brokenCodexPath
+    }
     [System.IO.File]::WriteAllText($nodePath, 'test executable')
     if (-not $isWindowsPlatform) {
         & chmod +x $nodePath
@@ -267,6 +279,24 @@ try {
     $originalPath = $env:PATH
     try {
         $env:PATH = "$fakeNodeDirectory$([System.IO.Path]::PathSeparator)$originalPath"
+        $brokenCodexWasRejected = $false
+        try {
+            & $packagedInstaller `
+                -DryRun `
+                -CodexBin $brokenCodexPath `
+                -QueuePath $queuePath `
+                -PowerShellBin 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' `
+                -TaskUserId 'TEST\CodexQueue' `
+                -ExportTaskXml (Join-Path $tempDirectory 'broken-codex.xml')
+        }
+        catch {
+            $brokenCodexWasRejected = $true
+            Assert-Contains $_.Exception.Message 'Codex CLI could not run with the scheduler PATH' 'Unrunnable Codex rejection should explain the scheduler environment'
+        }
+        if (-not $brokenCodexWasRejected) {
+            throw 'Installer should reject a Codex CLI that cannot run'
+        }
+
         & $packagedInstaller `
             -DryRun `
             -CodexBin $codexPath `

@@ -175,7 +175,7 @@ export const zhCN = {
       maxDelay: "最大延迟",
       seconds: "秒",
       codexBin: "Codex CLI 路径",
-      codexBinPlaceholder: "留空以使用 PATH 中的 codex",
+      codexBinPlaceholder: "留空以自动查找 Codex CLI",
       validation: {
         maxAttempts: "最大尝试次数必须是 1 到 20 的整数",
         initialDelay: "初始延迟必须是正整数",
