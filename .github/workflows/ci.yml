@@ -154,7 +154,12 @@ jobs:
         run: cargo test --locked --workspace --all-targets
 
       - name: Build native Tauri application
+        if: runner.os == 'macOS'
         run: npm run tauri build -- --no-bundle
+
+      - name: Build native Windows installers
+        if: runner.os == 'Windows'
+        run: npm run tauri build -- --bundles msi,nsis
 
       - name: Build scheduled CLI
         run: cargo build --locked --release --package codex-queue-demo
