@@ -120,6 +120,34 @@ jobs:
           }
           NODE
 
+      - name: Require macOS signing and notarization credentials
+        env:
+          HAS_APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE != '' }}
+          HAS_APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD != '' }}
+          HAS_APPLE_ID: ${{ secrets.APPLE_ID != '' }}
+          HAS_APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD != '' }}
+          HAS_APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID != '' }}
+        shell: bash
+        run: |
+          missing=()
+          for variable in \
+            APPLE_CERTIFICATE \
+            APPLE_CERTIFICATE_PASSWORD \
+            APPLE_ID \
+            APPLE_PASSWORD \
+            APPLE_TEAM_ID
+          do
+            configured_variable="HAS_${variable}"
+            if [[ "${!configured_variable}" != "true" ]]; then
+              missing+=("$variable")
+            fi
+          done
+
+          if [[ "${#missing[@]}" -gt 0 ]]; then
+            printf '::error::Missing required repository secrets: %s\n' "${missing[*]}"
+            exit 1
+          fi
+
   quality-gate:
     name: Full quality gate
     needs: validate-release
@@ -365,10 +393,64 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Build native installer bundles
+      - name: Build signed and notarized macOS installer bundles
+        if: matrix.platform == 'macos'
         env:
-          APPLE_SIGNING_IDENTITY: ${{ runner.os == 'macOS' && '-' || '' }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: npm run tauri build -- --target "${{ matrix.target }}"
+
+      - name: Build Windows installer bundles
+        if: matrix.platform == 'windows'
+        run: npm run tauri build -- --target "${{ matrix.target }}"
+
+      - name: Verify macOS distribution trust
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          shopt -s nullglob
+          bundle_dir="target/${{ matrix.target }}/release/bundle/dmg"
+          dmg_files=("$bundle_dir"/*.dmg)
+          if [[ "${#dmg_files[@]}" -ne 1 ]]; then
+            echo "::error::Expected exactly one DMG in $bundle_dir, found ${#dmg_files[@]}."
+            exit 1
+          fi
+
+          mount_dir="$(mktemp -d)"
+          cleanup() {
+            hdiutil detach "$mount_dir" -quiet >/dev/null 2>&1 || true
+            rmdir "$mount_dir" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          hdiutil attach -readonly -nobrowse -mountpoint "$mount_dir" "${dmg_files[0]}" >/dev/null
+          app_bundle="$mount_dir/Codex Queue.app"
+          if [[ ! -d "$app_bundle" ]]; then
+            echo "::error::The DMG does not contain Codex Queue.app at its root."
+            exit 1
+          fi
+
+          signature_info="$(codesign --display --verbose=4 "$app_bundle" 2>&1)"
+          if ! grep -q '^Authority=Developer ID Application:' <<<"$signature_info"; then
+            echo "::error::The app is not signed with a Developer ID Application certificate."
+            exit 1
+          fi
+          if ! grep -Eq '^CodeDirectory .*flags=.*runtime' <<<"$signature_info"; then
+            echo "::error::The app is not signed with hardened runtime enabled."
+            exit 1
+          fi
+          if ! grep -Eq '^TeamIdentifier=.+$' <<<"$signature_info"; then
+            echo "::error::The app signature does not include an Apple Team ID."
+            exit 1
+          fi
+
+          codesign --verify --deep --strict --verbose=4 "$app_bundle"
+          xcrun stapler validate "$app_bundle"
+          xcrun syspolicy_check distribution "$app_bundle"
+          spctl --assess --type execute --verbose=4 "$app_bundle"
 
       - name: Build scheduled CLI
         run: cargo build --locked --release --package codex-queue-demo --target "${{ matrix.target }}"
@@ -508,7 +590,7 @@ jobs:
 
           Scheduler ZIP files contain the prebuilt CLI and the matching install/uninstall scripts. Verify downloads with `SHA256SUMS` before installing.
 
-          These demo packages are not signed with a trusted Windows or Apple Developer certificate. See the README for platform security prompts and limitations.
+          The app bundles inside macOS DMGs are signed with Apple Developer ID and notarized. Windows installers are not code signed; see the README for platform security prompts and limitations.
           EOF
 
           git fetch --no-tags --force origin \

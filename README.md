@@ -158,6 +158,18 @@ Windows 11 Task Scheduler：
 
 上例通过 `--queue` / `-QueuePath` 改用 `demo/queue.json`；省略参数即可使用 app-data 默认队列。两个安装器都按本地时间每天 01:00 运行，并禁止重叠执行。Windows 使用 `Interactive` 登录模式，因为 `launchApp: true` 需要当前用户的桌面会话和 Codex 登录状态；支持时会请求 wake timer。macOS LaunchAgent 会在 Mac 唤醒后补跑错过的日历事件。
 
+macOS 上的两个应用启动目标不同：
+
+```bash
+# 手动打开队列管理界面
+open -b io.github.baicie.codex-queue
+
+# worker 在 launchApp: true 时打开实际执行任务的 Codex
+open -b com.openai.codex
+```
+
+`open` 只向 LaunchServices 请求启动应用，不会绕过 Gatekeeper。正式发布的 Codex Queue 必须通过 Developer ID 签名和 Apple notarization。
+
 卸载调度器会保留队列和运行日志：
 
 ```bash
@@ -203,8 +215,8 @@ Windows 11 Task Scheduler：
 推送与应用版本一致的 `v*` tag 会触发 `.github/workflows/release.yml`：
 
 ```bash
-git tag v0.2.2
-git push origin v0.2.2
+git tag v0.2.3
+git push origin v0.2.3
 ```
 
 Release workflow 只接受位于 `main` 历史上的 tag，并在任何发布构建开始前重新执行完整的前端、Rust 和调度脚本质量门。质量门通过后会生成：
@@ -214,18 +226,35 @@ Release workflow 只接受位于 `main` 历史上的 tag，并在任何发布构
 - Windows x64 MSI、NSIS installer 和 scheduler ZIP。
 - 覆盖全部安装包与 scheduler ZIP 的 `SHA256SUMS`。
 
-每个 scheduler ZIP 都包含对应平台的预编译 CLI、安装/卸载脚本和 MIT License。Workflow 会先核对预期资产并验证校验和，再发布 GitHub Release；所有第三方 Actions 都固定到经过审计的完整 commit SHA。
+每个 scheduler ZIP 都包含对应平台的预编译 CLI、安装/卸载脚本和 MIT License。Workflow 会先核对预期资产并验证校验和，再发布 GitHub Release；macOS 构建还必须通过 Developer ID、hardened runtime、notary ticket、`syspolicy_check` 和 `spctl` 检查。所有第三方 Actions 都固定到经过审计的完整 commit SHA。
 
 当前不构建 Linux 安装包。发布前需要同步更新 `package.json`、`Cargo.toml`、`src-tauri/Cargo.toml` 和 `src-tauri/tauri.conf.json` 中的版本。
 
 ## 安装包签名说明
 
-自动 Release 是演示用途，不包含受信任的 Windows 代码签名证书、Apple Developer ID 签名或 Apple notarization：
+macOS Release 中的 app bundle 强制使用 Developer ID Application 证书并完成 Apple notarization。Workflow 会只读挂载生成的 DMG 并检查其中的实际 app；缺少以下任一 GitHub Actions repository secret 时，Release 会在构建前失败。DMG 内的 app 未通过构建时的签名、公证或 Gatekeeper 检查时也不会发布：
 
-- macOS 构建使用 ad-hoc identity `-`，以满足 Apple Silicon 对互联网下载应用的基本签名要求，但 Gatekeeper 仍可能提示来源不明。请从仓库 Release 下载，并通过“系统设置 > 隐私与安全性”确认打开。参见 [Tauri macOS signing](https://v2.tauri.app/distribute/sign/macos/)。
-- Windows 安装包未签名，Microsoft Defender SmartScreen 可能显示未知发布者警告。请只运行从本仓库 Release 获取并核对版本的文件。参见 [Tauri Windows signing](https://v2.tauri.app/distribute/sign/windows/)。
+- `APPLE_CERTIFICATE`：Developer ID Application `.p12` 的 Base64 内容。
+- `APPLE_CERTIFICATE_PASSWORD`：导出 `.p12` 时设置的密码。
+- `APPLE_ID`：Apple Developer 账号邮箱。
+- `APPLE_PASSWORD`：该账号的 app-specific password，不是登录密码。
+- `APPLE_TEAM_ID`：Apple Developer Team ID。
 
-面向真实用户分发前，应配置正式证书、macOS notarization 和对应 GitHub Secrets。
+可使用 GitHub CLI 交互式写入 Secrets，避免把密码保留在 shell history：
+
+```bash
+gh secret set APPLE_CERTIFICATE < certificate-base64.txt
+gh secret set APPLE_CERTIFICATE_PASSWORD
+gh secret set APPLE_ID
+gh secret set APPLE_PASSWORD
+gh secret set APPLE_TEAM_ID
+```
+
+Apple notarization 需要付费 Apple Developer Program 账号；免费账号只能用于开发测试。证书准备和环境变量定义参见 [Tauri macOS signing](https://v2.tauri.app/distribute/sign/macos/) 与 [Tauri environment variables](https://v2.tauri.app/reference/environment-variables/)。
+
+历史版本 `v0.2.2` 使用 ad-hoc 签名且没有 notarization。其校验和正确时，可先尝试打开一次，再到“系统设置 > 隐私与安全性 > 安全性”选择“仍要打开”进行一次性授权；该操作只适合已核验来源的历史包，不是发布修复。
+
+Windows 安装包目前仍未签名，Microsoft Defender SmartScreen 可能显示未知发布者警告。请只运行从本仓库 Release 获取并核对版本的文件。参见 [Tauri Windows signing](https://v2.tauri.app/distribute/sign/windows/)。
 
 ## Demo 限制
 
