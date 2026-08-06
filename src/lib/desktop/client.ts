@@ -8,6 +8,8 @@ import {
   type Queue,
   type QueueSnapshot,
   type RunSummary,
+  type TaskRunOutput,
+  type TaskRunSummary,
   type Task,
   validateQueue,
 } from "@/domain/queue";
@@ -21,6 +23,12 @@ export interface DesktopClient {
     expectedRevision: string,
   ): Promise<QueueSnapshot>;
   runQueue(path: string, codexBin?: string): Promise<RunSummary>;
+  listTaskRuns(path: string, taskId: string): Promise<TaskRunSummary[]>;
+  readTaskRun(
+    path: string,
+    taskId: string,
+    runId: string,
+  ): Promise<TaskRunOutput>;
   openQueueFile(): Promise<QueueSnapshot | null>;
   saveQueueFile(
     queue: Queue,
@@ -31,6 +39,8 @@ export interface DesktopClient {
 
 const BROWSER_QUEUE_PATH = "browser://queues/demo.json";
 const STORAGE_PREFIX = "codex-queue.queue:";
+const RUN_STORAGE_PREFIX = "codex-queue.runs:";
+const MAX_BROWSER_TASK_RUNS = 100;
 const JSON_FILTERS = [{ name: "JSON", extensions: ["json"] }];
 let fallbackRevisionCounter = 0;
 const fallbackBrowserLocks = new Map<string, Promise<void>>();
@@ -38,6 +48,12 @@ const fallbackBrowserLocks = new Map<string, Promise<void>>();
 interface BrowserQueueEnvelope {
   revision: string;
   queue: Queue;
+}
+
+interface BrowserRunRecord {
+  taskId: string;
+  taskCreatedAt: string;
+  output: TaskRunOutput;
 }
 
 class TauriDesktopClient implements DesktopClient {
@@ -85,6 +101,34 @@ class TauriDesktopClient implements DesktopClient {
       }
 
       return runBrowserQueue(path);
+    });
+  }
+
+  async listTaskRuns(path: string, taskId: string): Promise<TaskRunSummary[]> {
+    return withReadableError(async () => {
+      if (isTauri()) {
+        return invoke<TaskRunSummary[]>("list_task_runs", { path, taskId });
+      }
+
+      return listBrowserTaskRuns(path, taskId);
+    });
+  }
+
+  async readTaskRun(
+    path: string,
+    taskId: string,
+    runId: string,
+  ): Promise<TaskRunOutput> {
+    return withReadableError(async () => {
+      if (isTauri()) {
+        return invoke<TaskRunOutput>("read_task_run", {
+          path,
+          taskId,
+          runId,
+        });
+      }
+
+      return readBrowserTaskRun(path, taskId, runId);
     });
   }
 
@@ -229,7 +273,17 @@ function saveBrowserQueueUnlocked(
 }
 
 async function runBrowserQueue(path: string): Promise<RunSummary> {
+  return withBrowserQueueLock(path, () => runBrowserQueueUnlocked(path));
+}
+
+function runBrowserQueueUnlocked(path: string): RunSummary {
   const snapshot = loadBrowserQueue(path);
+  const storage = browserStorage();
+  const queueKey = storageKey(path);
+  const originalSerializedQueue = storage.getItem(queueKey);
+  if (originalSerializedQueue === null) {
+    throw new Error(`Queue file not found: ${path}`);
+  }
   const plannedIds = new Set(snapshot.orderedIds);
   const newlyBlocked = new Map(
     snapshot.blocked.map((blocked) => [blocked.taskId, blocked]),
@@ -253,9 +307,228 @@ async function runBrowserQueue(path: string): Promise<RunSummary> {
       .filter((task) => task.status === "blocked")
       .map((task) => task.id),
   };
+  const newRunRecords = tasks
+    .filter((task) => plannedIds.has(task.id))
+    .map(createBrowserRunRecord);
+  const existingRunRecords = readBrowserRunRecords(path);
+  const runRecords = mergeBrowserRunRecords(
+    tasks,
+    newRunRecords,
+    existingRunRecords,
+  );
 
-  await saveBrowserQueue(path, { ...snapshot.queue, tasks }, snapshot.revision);
+  saveBrowserQueueUnlocked(
+    path,
+    { ...snapshot.queue, tasks },
+    snapshot.revision,
+  );
+  try {
+    storage.setItem(runStorageKey(path), JSON.stringify(runRecords));
+  } catch (error) {
+    storage.setItem(queueKey, originalSerializedQueue);
+    throw error;
+  }
   return summary;
+}
+
+function listBrowserTaskRuns(path: string, taskId: string): TaskRunSummary[] {
+  const task = findBrowserTask(path, taskId);
+  return readBrowserRunRecords(path)
+    .filter(
+      (record) =>
+        record.taskId === task.id && record.taskCreatedAt === task.createdAt,
+    )
+    .map((record) => record.output.run)
+    .sort(compareBrowserRunsNewest)
+    .slice(0, MAX_BROWSER_TASK_RUNS);
+}
+
+function readBrowserTaskRun(
+  path: string,
+  taskId: string,
+  runId: string,
+): TaskRunOutput {
+  const task = findBrowserTask(path, taskId);
+  const record = readBrowserRunRecords(path).find(
+    (candidate) =>
+      candidate.taskId === task.id &&
+      candidate.taskCreatedAt === task.createdAt &&
+      candidate.output.run.id === runId,
+  );
+  if (!record) {
+    throw new Error(`run not found for task ${taskId}: ${runId}`);
+  }
+  return record.output;
+}
+
+function findBrowserTask(path: string, taskId: string): Task {
+  const task = loadBrowserQueue(path).queue.tasks.find(
+    (candidate) => candidate.id === taskId,
+  );
+  if (!task) {
+    throw new Error(`task not found in queue: ${taskId}`);
+  }
+  return task;
+}
+
+function createBrowserRunRecord(task: Task): BrowserRunRecord {
+  const startedAt = task.startedAt ?? task.finishedAt;
+  const attempt = task.attempts;
+  if (!startedAt || !attempt) {
+    throw new Error(`cannot create browser run output for task ${task.id}`);
+  }
+
+  const run: TaskRunSummary = {
+    id: createBrowserRunId(task.id, attempt, startedAt),
+    attempt,
+    startedAt,
+  };
+  return {
+    taskId: task.id,
+    taskCreatedAt: task.createdAt,
+    output: {
+      run,
+      finalOutput: {
+        content: JSON.stringify(
+          {
+            mode: "browser-demo",
+            taskId: task.id,
+            status: task.status,
+          },
+          null,
+          2,
+        ),
+        truncated: false,
+      },
+      events: {
+        content: `${JSON.stringify({
+          type: "task.completed",
+          taskId: task.id,
+          attempt,
+          startedAt,
+        })}\n`,
+        truncated: false,
+      },
+      stderr: { content: "", truncated: false },
+    },
+  };
+}
+
+function createBrowserRunId(
+  taskId: string,
+  attempt: number,
+  startedAt: string,
+): string {
+  const timestamp = startedAt.replace(/\.\d+Z$/, "Z").replace(/[-:]/g, "");
+  const suffix = createBrowserRevision().replace(/[^A-Za-z0-9]/g, "");
+  return `${timestamp}-${taskId}-attempt-${attempt}-${suffix}`;
+}
+
+function mergeBrowserRunRecords(
+  tasks: Task[],
+  newRecords: BrowserRunRecord[],
+  existingRecords: BrowserRunRecord[],
+): BrowserRunRecord[] {
+  const activeTaskInstances = new Set(
+    tasks.map((task) => browserTaskInstanceKey(task.id, task.createdAt)),
+  );
+
+  const counts = new Map<string, number>();
+  return [...newRecords, ...existingRecords]
+    .sort((left, right) =>
+      compareBrowserRunsNewest(left.output.run, right.output.run),
+    )
+    .filter((record) => {
+      const taskInstance = browserTaskInstanceKey(
+        record.taskId,
+        record.taskCreatedAt,
+      );
+      if (!activeTaskInstances.has(taskInstance)) return false;
+
+      const count = counts.get(taskInstance) ?? 0;
+      if (count >= MAX_BROWSER_TASK_RUNS) return false;
+      counts.set(taskInstance, count + 1);
+      return true;
+    });
+}
+
+function browserTaskInstanceKey(taskId: string, createdAt: string): string {
+  return `${taskId}\u0000${createdAt}`;
+}
+
+function readBrowserRunRecords(path: string): BrowserRunRecord[] {
+  const input = browserStorage().getItem(runStorageKey(path));
+  if (input === null) return [];
+
+  let value: unknown;
+  try {
+    value = JSON.parse(input);
+  } catch (error) {
+    throw new Error(
+      `cannot read browser run storage for ${path}: ${errorMessage(error)}`,
+      { cause: error },
+    );
+  }
+  if (!Array.isArray(value) || !value.every(isBrowserRunRecord)) {
+    throw new Error(`invalid browser run storage for ${path}`);
+  }
+  return value;
+}
+
+function isBrowserRunRecord(value: unknown): value is BrowserRunRecord {
+  return (
+    isRecord(value) &&
+    typeof value.taskId === "string" &&
+    isDateTime(value.taskCreatedAt) &&
+    isTaskRunOutput(value.output)
+  );
+}
+
+function isTaskRunOutput(value: unknown): value is TaskRunOutput {
+  return (
+    isRecord(value) &&
+    isTaskRunSummary(value.run) &&
+    isRunArtifact(value.finalOutput) &&
+    isRunArtifact(value.events) &&
+    isRunArtifact(value.stderr)
+  );
+}
+
+function isTaskRunSummary(value: unknown): value is TaskRunSummary {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    value.id.length > 0 &&
+    Number.isSafeInteger(value.attempt) &&
+    (value.attempt as number) > 0 &&
+    isDateTime(value.startedAt)
+  );
+}
+
+function isRunArtifact(value: unknown): value is TaskRunOutput["finalOutput"] {
+  return (
+    isRecord(value) &&
+    typeof value.content === "string" &&
+    typeof value.truncated === "boolean"
+  );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isDateTime(value: unknown): value is string {
+  return typeof value === "string" && !Number.isNaN(Date.parse(value));
+}
+
+function compareBrowserRunsNewest(
+  left: TaskRunSummary,
+  right: TaskRunSummary,
+): number {
+  return (
+    right.startedAt.localeCompare(left.startedAt) ||
+    right.id.localeCompare(left.id)
+  );
 }
 
 async function withBrowserQueueLock<T>(
@@ -356,6 +629,10 @@ function browserStorage(): Storage {
 
 function storageKey(path: string): string {
   return `${STORAGE_PREFIX}${path}`;
+}
+
+function runStorageKey(path: string): string {
+  return `${RUN_STORAGE_PREFIX}${path}`;
 }
 
 async function withReadableError<T>(action: () => Promise<T>): Promise<T> {

@@ -5,6 +5,8 @@ fn main() {
             "load_queue",
             "save_queue",
             "run_queue",
+            "list_task_runs",
+            "read_task_run",
         ]),
     ))
     .expect("failed to build Tauri application");

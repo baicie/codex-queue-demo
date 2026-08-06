@@ -25,12 +25,14 @@ import {
 import { QueueToolbar, type FileAction } from "@/features/queue/queue-toolbar";
 import { TaskEditor } from "@/features/queue/task-editor";
 import { TaskRow } from "@/features/queue/task-row";
+import { TaskRunOutputSheet } from "@/features/queue/task-run-output";
 import { desktopClient, type DesktopClient } from "@/lib/desktop/client";
 import { Skeleton } from "@/components/ui/skeleton";
 
 type TaskFilter = "all" | TaskStatus;
 type RevisionSession = { revision: string };
 type TaskSession = RevisionSession & { task: Task };
+type EditingSession = TaskSession & { idLocked: boolean };
 
 const filters: TaskFilter[] = [
   "all",
@@ -58,9 +60,10 @@ export function QueueApp({
   const [isRunning, setIsRunning] = useState(false);
   const [runPlanIds, setRunPlanIds] = useState<string[]>([]);
   const [creatingSession, setCreatingSession] = useState<RevisionSession>();
-  const [editingSession, setEditingSession] = useState<TaskSession>();
+  const [editingSession, setEditingSession] = useState<EditingSession>();
   const [deletingSession, setDeletingSession] = useState<TaskSession>();
   const [settingsSession, setSettingsSession] = useState<RevisionSession>();
+  const [outputTask, setOutputTask] = useState<Task>();
   const [codexBin, setCodexBin] = useState(readStoredCodexBin);
 
   useEffect(() => {
@@ -358,6 +361,26 @@ export function QueueApp({
     }
   }
 
+  async function editTask(task: Task) {
+    if (!snapshot) return;
+    const revision = snapshot.revision;
+    const queuePath = snapshot.path;
+    const requestEpoch = snapshotEpochRef.current;
+    let idLocked = (task.attempts ?? 0) > 0;
+
+    if (!idLocked) {
+      try {
+        idLocked = (await client.listTaskRuns(queuePath, task.id)).length > 0;
+      } catch {
+        idLocked = true;
+      }
+    }
+
+    if (requestEpoch === snapshotEpochRef.current) {
+      setEditingSession({ task, revision, idLocked });
+    }
+  }
+
   async function deleteTask(
     task: Task,
     expectedRevision: string,
@@ -498,13 +521,12 @@ export function QueueApp({
               position={planPosition(snapshot, task.id)}
               blockedReason={blockedById.get(task.id)}
               disabled={isRunning}
-              onEdit={(task) =>
-                setEditingSession({ task, revision: snapshot.revision })
-              }
+              onEdit={(task) => void editTask(task)}
               onDelete={(task) =>
                 setDeletingSession({ task, revision: snapshot.revision })
               }
               onRequeue={(nextTask) => void requeueTask(nextTask)}
+              onViewOutput={setOutputTask}
             />
           ))
         )}
@@ -528,6 +550,7 @@ export function QueueApp({
               open
               task={editingSession.task}
               tasks={snapshot.queue.tasks}
+              idLocked={editingSession.idLocked}
               onOpenChange={(open) => !open && setEditingSession(undefined)}
               onSave={(task, previousId) =>
                 saveTask(task, editingSession.revision, previousId)
@@ -552,6 +575,12 @@ export function QueueApp({
               }
             />
           )}
+          <TaskRunOutputSheet
+            task={outputTask}
+            queuePath={snapshot.path}
+            client={client}
+            onOpenChange={(open) => !open && setOutputTask(undefined)}
+          />
         </>
       )}
     </main>

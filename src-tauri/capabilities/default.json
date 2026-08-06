@@ -10,6 +10,8 @@
     "allow-app-info",
     "allow-load-queue",
     "allow-save-queue",
-    "allow-run-queue"
+    "allow-run-queue",
+    "allow-list-task-runs",
+    "allow-read-task-run"
   ]
 }
