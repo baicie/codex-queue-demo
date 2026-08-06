@@ -164,7 +164,7 @@ pub fn read_task_run(
         return Err(not_found());
     }
 
-    let runs_directory = runs_directory.ok_or_else(&not_found)?;
+    let runs_directory = runs_directory.ok_or_else(not_found)?;
     let run_directory = canonical_run_directory(&runs_directory, &runs_directory.join(&run_id))
         .map_err(|_| not_found())?;
 
