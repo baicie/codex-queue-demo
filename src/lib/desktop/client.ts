@@ -273,7 +273,17 @@ function saveBrowserQueueUnlocked(
 }
 
 async function runBrowserQueue(path: string): Promise<RunSummary> {
+  return withBrowserQueueLock(path, () => runBrowserQueueUnlocked(path));
+}
+
+function runBrowserQueueUnlocked(path: string): RunSummary {
   const snapshot = loadBrowserQueue(path);
+  const storage = browserStorage();
+  const queueKey = storageKey(path);
+  const originalSerializedQueue = storage.getItem(queueKey);
+  if (originalSerializedQueue === null) {
+    throw new Error(`Queue file not found: ${path}`);
+  }
   const plannedIds = new Set(snapshot.orderedIds);
   const newlyBlocked = new Map(
     snapshot.blocked.map((blocked) => [blocked.taskId, blocked]),
@@ -300,11 +310,24 @@ async function runBrowserQueue(path: string): Promise<RunSummary> {
   const newRunRecords = tasks
     .filter((task) => plannedIds.has(task.id))
     .map(createBrowserRunRecord);
-  const existingRunRecords =
-    newRunRecords.length > 0 ? readBrowserRunRecords(path) : [];
+  const existingRunRecords = readBrowserRunRecords(path);
+  const runRecords = mergeBrowserRunRecords(
+    tasks,
+    newRunRecords,
+    existingRunRecords,
+  );
 
-  await saveBrowserQueue(path, { ...snapshot.queue, tasks }, snapshot.revision);
-  appendBrowserRunRecords(path, newRunRecords, existingRunRecords);
+  saveBrowserQueueUnlocked(
+    path,
+    { ...snapshot.queue, tasks },
+    snapshot.revision,
+  );
+  try {
+    storage.setItem(runStorageKey(path), JSON.stringify(runRecords));
+  } catch (error) {
+    storage.setItem(queueKey, originalSerializedQueue);
+    throw error;
+  }
   return summary;
 }
 
@@ -401,26 +424,36 @@ function createBrowserRunId(
   return `${timestamp}-${taskId}-attempt-${attempt}-${suffix}`;
 }
 
-function appendBrowserRunRecords(
-  path: string,
-  records: BrowserRunRecord[],
+function mergeBrowserRunRecords(
+  tasks: Task[],
+  newRecords: BrowserRunRecord[],
   existingRecords: BrowserRunRecord[],
-): void {
-  if (records.length === 0) return;
+): BrowserRunRecord[] {
+  const activeTaskInstances = new Set(
+    tasks.map((task) => browserTaskInstanceKey(task.id, task.createdAt)),
+  );
 
   const counts = new Map<string, number>();
-  const bounded = [...records, ...existingRecords]
+  return [...newRecords, ...existingRecords]
     .sort((left, right) =>
       compareBrowserRunsNewest(left.output.run, right.output.run),
     )
     .filter((record) => {
-      const taskInstance = `${record.taskId}\u0000${record.taskCreatedAt}`;
+      const taskInstance = browserTaskInstanceKey(
+        record.taskId,
+        record.taskCreatedAt,
+      );
+      if (!activeTaskInstances.has(taskInstance)) return false;
+
       const count = counts.get(taskInstance) ?? 0;
       if (count >= MAX_BROWSER_TASK_RUNS) return false;
       counts.set(taskInstance, count + 1);
       return true;
     });
-  browserStorage().setItem(runStorageKey(path), JSON.stringify(bounded));
+}
+
+function browserTaskInstanceKey(taskId: string, createdAt: string): string {
+  return `${taskId}\u0000${createdAt}`;
 }
 
 function readBrowserRunRecords(path: string): BrowserRunRecord[] {

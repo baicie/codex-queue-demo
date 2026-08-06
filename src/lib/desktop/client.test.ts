@@ -355,6 +355,117 @@ describe("desktopClient in a browser", () => {
     );
   });
 
+  it("rolls back browser task state when run output cannot be stored", async () => {
+    const { defaultQueuePath } = await desktopClient.getAppInfo();
+    const before = await desktopClient.loadQueue(defaultQueuePath);
+    const originalSetItem = Storage.prototype.setItem;
+    const setItem = vi
+      .spyOn(Storage.prototype, "setItem")
+      .mockImplementation(function (this: Storage, key, value) {
+        if (key === `codex-queue.runs:${defaultQueuePath}`) {
+          throw new DOMException("run storage is full", "QuotaExceededError");
+        }
+        return originalSetItem.call(this, key, value);
+      });
+
+    try {
+      await expect(desktopClient.runQueue(defaultQueuePath)).rejects.toThrow(
+        "run storage is full",
+      );
+
+      const after = await desktopClient.loadQueue(defaultQueuePath);
+      expect(after.revision).toBe(before.revision);
+      expect(after.queue).toEqual(before.queue);
+    } finally {
+      setItem.mockRestore();
+    }
+  });
+
+  it("keeps browser run persistence inside the queue's exclusive lock", async () => {
+    const { defaultQueuePath } = await desktopClient.getAppInfo();
+    await desktopClient.loadQueue(defaultQueuePath);
+    const originalLocks = Object.getOwnPropertyDescriptor(
+      window.navigator,
+      "locks",
+    );
+    let lockDepth = 0;
+    const request = vi.fn(
+      async (_name: string, _options: LockOptions, callback: () => unknown) => {
+        lockDepth += 1;
+        try {
+          return await callback();
+        } finally {
+          lockDepth -= 1;
+        }
+      },
+    );
+    Object.defineProperty(window.navigator, "locks", {
+      configurable: true,
+      value: { request } as unknown as LockManager,
+    });
+    const originalSetItem = Storage.prototype.setItem;
+    let storedRunInsideLock = false;
+    const setItem = vi
+      .spyOn(Storage.prototype, "setItem")
+      .mockImplementation(function (this: Storage, key, value) {
+        if (key === `codex-queue.runs:${defaultQueuePath}`) {
+          storedRunInsideLock = lockDepth === 1;
+        }
+        return originalSetItem.call(this, key, value);
+      });
+
+    try {
+      await desktopClient.runQueue(defaultQueuePath);
+
+      expect(request).toHaveBeenCalledOnce();
+      expect(request).toHaveBeenCalledWith(
+        `codex-queue.queue-lock:${defaultQueuePath}`,
+        { mode: "exclusive" },
+        expect.any(Function),
+      );
+      expect(storedRunInsideLock).toBe(true);
+    } finally {
+      setItem.mockRestore();
+      if (originalLocks) {
+        Object.defineProperty(window.navigator, "locks", originalLocks);
+      } else {
+        Reflect.deleteProperty(window.navigator, "locks");
+      }
+    }
+  });
+
+  it("prunes browser run records for deleted task instances", async () => {
+    const { defaultQueuePath } = await desktopClient.getAppInfo();
+    await desktopClient.runQueue(defaultQueuePath);
+    const completed = await desktopClient.loadQueue(defaultQueuePath);
+    const retainedTask = completed.queue.tasks[0];
+    const requeued = {
+      ...completed.queue,
+      tasks: [
+        {
+          ...retainedTask,
+          status: "pending" as const,
+          dependsOn: [],
+        },
+      ],
+    };
+    await desktopClient.saveQueue(
+      defaultQueuePath,
+      requeued,
+      completed.revision,
+    );
+
+    await desktopClient.runQueue(defaultQueuePath);
+
+    const stored: unknown = JSON.parse(
+      localStorage.getItem(`codex-queue.runs:${defaultQueuePath}`) ?? "null",
+    );
+    expect(stored).toEqual([
+      expect.objectContaining({ taskId: retainedTask.id }),
+      expect.objectContaining({ taskId: retainedTask.id }),
+    ]);
+  });
+
   it("persists a structured reason when a browser task is blocked", async () => {
     const path = "browser://queues/blocked.json";
     const queue = createEmptyQueue();
