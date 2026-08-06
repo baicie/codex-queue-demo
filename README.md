@@ -19,6 +19,7 @@ Tauri UI 不承担后台定时唤醒。即使桌面窗口关闭，已安装的 m
 - 在 macOS 通过 bundle ID 打开 Codex Desktop，在 Windows 通过 `codex app <workspace>` 打开工作区。
 - 通过标准输入调用 `codex exec` 执行任务；`codex app` 和 `codex exec` 是本 Demo 使用的 Codex CLI 命令契约。
 - 将每次执行的事件、标准错误和最终结果保存到 `runs/`。
+- 在任务菜单中查看最终结果、事件流、错误输出和最近 100 条运行记录。
 - 对网络、限流和暂时性 API 错误使用有上限的指数退避。
 - 为每次 `codex exec` 设置 45 分钟上限；超时会终止并回收子进程，再按暂时性错误重试。
 - 桌面端保存时校验队列 revision，拒绝用旧 UI 快照覆盖调度器刚写入的执行结果。
@@ -38,7 +39,7 @@ React + Vite + shadcn/ui
           |
           +----> queue.json + file lock
           +----> Codex Desktop + Codex CLI
-          +----> runs/<task>/<attempt>/
+          +----> runs/<timestamp>-<task-id>-attempt-<n>-<suffix>/
 ```
 
 主要目录：
@@ -121,6 +122,41 @@ Windows 11 实际执行：
 ```powershell
 .\target\release\codex-queue-demo.exe run --queue .\demo\queue.json
 ```
+
+## 从创建任务到查看输出
+
+新建或保存任务只会更新 `queue.json`，不会立即调用 Codex。需要在桌面端点击顶部的“运行队列”，或先按下一节安装每天 01:00 的系统调度器。已经成功、失败或阻塞的任务不会自动再次执行；需要在任务菜单中选择“重新入队”后再运行。
+
+创建任务时需要注意：
+
+- `workspace` 建议填写要修改项目的绝对路径，例如 macOS 的 `/Users/name/projects/app` 或 Windows 的 `C:\Users\name\projects\app`。
+- 相对路径（包括 `.`）以 `queue.json` 所在目录为基准。默认队列中的 `.` 指向 Codex Queue 的 app-data 目录，不是当前打开的工程。
+- `prompt` 应明确描述要完成的工程工作、期望结果和验证方式。只有“测试”或“1111”这类输入通常只会得到一段文字回复，不会修改项目。
+
+任务至少执行过一次后，状态会显示尝试次数。打开任务右上角的“更多操作”，选择“查看输出”，可在“最终结果 / 事件 / 错误输出”之间切换，也可以刷新刚完成的后台记录。尚未执行的任务会显示空状态。
+
+原始文件与队列位于同一目录下的 `runs/`：
+
+```text
+runs/<timestamp>-<task-id>-attempt-<n>-<suffix>/
+  final.txt
+  events.jsonl
+  stderr.log
+```
+
+默认队列的原始输出目录：
+
+```bash
+# macOS
+open "$HOME/Library/Application Support/io.github.baicie.codex-queue/runs"
+```
+
+```powershell
+# Windows 11
+explorer "$env:APPDATA\io.github.baicie.codex-queue\runs"
+```
+
+Worker 使用 `codex exec --json --ephemeral` 进行无人值守执行，并由 Codex Queue 自己保存上述产物。Codex CLI 文档说明 `--ephemeral` 不会把 session rollout 文件持久化到磁盘，因此该后台执行不会作为可恢复任务出现在 Codex Desktop 的任务列表中；`launchApp: true` 只负责打开对应工作区。参见 [Codex CLI `exec` 参考](https://developers.openai.com/codex/cli/reference#codex-exec)。
 
 实际执行前会运行一次 `codex --version`，确认 CLI 及其解释器可用；检查失败不会修改队列或增加任务尝试次数。默认发现位置包括 macOS 的 `~/.local/bin/codex`、Codex/ChatGPT 应用内置 CLI，以及 Windows 的 `%LOCALAPPDATA%\Programs\OpenAI\Codex\bin\codex.exe`。也可以在队列设置中填写绝对路径，或通过 `CODEX_BIN` / `--codex-bin` 指定。后台进程不会继承交互式 shell 配置，因此仅指向 npm wrapper 还不够，其 `node` 解释器也必须位于运行环境的 `PATH` 中。参见 [Codex CLI 安装](https://learn.chatgpt.com/docs/codex/cli) 和 [Codex 环境变量](https://learn.chatgpt.com/docs/config-file/environment-variables)。
 

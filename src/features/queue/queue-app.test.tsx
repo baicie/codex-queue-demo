@@ -82,6 +82,29 @@ function createClient() {
         failedIds: [],
         blockedIds: [],
       }),
+    listTaskRuns: vi.fn().mockResolvedValue([
+      {
+        id: "20260728T020000Z-verify-build-attempt-1-latest",
+        attempt: 1,
+        startedAt: "2026-07-28T02:00:00Z",
+      },
+    ]),
+    readTaskRun: vi.fn().mockResolvedValue({
+      run: {
+        id: "20260728T020000Z-verify-build-attempt-1-latest",
+        attempt: 1,
+        startedAt: "2026-07-28T02:00:00Z",
+      },
+      finalOutput: {
+        content: "已验证 macOS 与 Windows 构建。",
+        truncated: false,
+      },
+      events: {
+        content: '{"type":"turn.completed"}\n',
+        truncated: false,
+      },
+      stderr: { content: "", truncated: false },
+    }),
     openQueueFile: vi
       .fn<() => Promise<QueueSnapshot | null>>()
       .mockResolvedValue(null),
@@ -137,6 +160,212 @@ describe("QueueApp", () => {
     expect(screen.getByText("验证跨平台构建")).toBeInTheDocument();
   });
 
+  it("opens the latest output for a completed task", async () => {
+    const client = createClient();
+    renderQueueApp(client);
+    await screen.findByText("验证跨平台构建");
+
+    fireEvent.pointerDown(
+      screen.getByRole("button", {
+        name: "验证跨平台构建的更多操作",
+      }),
+      { button: 0, ctrlKey: false },
+    );
+    fireEvent.click(await screen.findByRole("menuitem", { name: "查看输出" }));
+
+    expect(
+      await screen.findByRole("heading", { name: "任务输出" }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "任务输出" })).toHaveClass(
+      "data-[side=right]:w-full",
+      "data-[side=right]:sm:max-w-2xl",
+    );
+    expect(
+      await screen.findByText("已验证 macOS 与 Windows 构建。"),
+    ).toBeInTheDocument();
+    expect(client.listTaskRuns).toHaveBeenCalledWith(
+      snapshot.path,
+      "verify-build",
+    );
+    expect(client.readTaskRun).toHaveBeenCalledWith(
+      snapshot.path,
+      "verify-build",
+      "20260728T020000Z-verify-build-attempt-1-latest",
+    );
+  });
+
+  it("refreshes an open task output sheet", async () => {
+    const client = createClient();
+    const run = {
+      id: "20260728T020000Z-verify-build-attempt-1-latest",
+      attempt: 1,
+      startedAt: "2026-07-28T02:00:00Z",
+    };
+    client.readTaskRun
+      .mockResolvedValueOnce({
+        run,
+        finalOutput: { content: "第一次读取", truncated: false },
+        events: { content: "", truncated: false },
+        stderr: { content: "", truncated: false },
+      })
+      .mockResolvedValueOnce({
+        run,
+        finalOutput: { content: "刷新后的结果", truncated: false },
+        events: { content: "", truncated: false },
+        stderr: { content: "", truncated: false },
+      });
+    renderQueueApp(client);
+    await screen.findByText("验证跨平台构建");
+
+    fireEvent.pointerDown(
+      screen.getByRole("button", {
+        name: "验证跨平台构建的更多操作",
+      }),
+      { button: 0, ctrlKey: false },
+    );
+    fireEvent.click(await screen.findByRole("menuitem", { name: "查看输出" }));
+    expect(await screen.findByText("第一次读取")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "关闭" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "刷新任务输出" }));
+
+    expect(await screen.findByText("刷新后的结果")).toBeInTheDocument();
+    expect(client.listTaskRuns).toHaveBeenCalledTimes(2);
+  });
+
+  it("shows the empty output state before a task has run", async () => {
+    const client = createClient();
+    client.listTaskRuns.mockResolvedValue([]);
+    renderQueueApp(client);
+    await screen.findByText("准备发布说明");
+
+    fireEvent.pointerDown(
+      screen.getByRole("button", {
+        name: "准备发布说明的更多操作",
+      }),
+      { button: 0, ctrlKey: false },
+    );
+    fireEvent.click(await screen.findByRole("menuitem", { name: "查看输出" }));
+
+    expect(await screen.findByText("还没有运行记录")).toBeInTheDocument();
+    expect(client.listTaskRuns).toHaveBeenCalledWith(
+      snapshot.path,
+      "prepare-release",
+    );
+    expect(client.readTaskRun).not.toHaveBeenCalled();
+  });
+
+  it("keeps run history selectable when the latest output cannot be read", async () => {
+    const client = createClient();
+    const latestRun = {
+      id: "20260728T020000Z-verify-build-attempt-2-latest",
+      attempt: 2,
+      startedAt: "2026-07-28T02:00:00Z",
+    };
+    const olderRun = {
+      id: "20260728T010000Z-verify-build-attempt-1-older",
+      attempt: 1,
+      startedAt: "2026-07-28T01:00:00Z",
+    };
+    client.listTaskRuns.mockResolvedValue([latestRun, olderRun]);
+    client.readTaskRun.mockImplementation(async (_path, _taskId, runId) => {
+      if (runId === latestRun.id) throw new Error("latest output is damaged");
+      return {
+        run: olderRun,
+        finalOutput: { content: "较早的运行结果", truncated: false },
+        events: { content: "", truncated: false },
+        stderr: { content: "", truncated: false },
+      };
+    });
+    renderQueueApp(client);
+    await screen.findByText("验证跨平台构建");
+
+    fireEvent.pointerDown(
+      screen.getByRole("button", {
+        name: "验证跨平台构建的更多操作",
+      }),
+      { button: 0, ctrlKey: false },
+    );
+    fireEvent.click(await screen.findByRole("menuitem", { name: "查看输出" }));
+
+    expect(await screen.findByText("无法读取任务输出")).toBeInTheDocument();
+    expect(
+      screen.getByRole("combobox", { name: "运行记录" }),
+    ).toBeInTheDocument();
+
+    fireEvent.keyDown(screen.getByRole("combobox", { name: "运行记录" }), {
+      key: "ArrowDown",
+    });
+    fireEvent.click(await screen.findByRole("option", { name: /第 1 次/ }));
+    expect(await screen.findByText("较早的运行结果")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "刷新任务输出" }));
+
+    await waitFor(() => expect(client.listTaskRuns).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(client.readTaskRun).toHaveBeenLastCalledWith(
+        snapshot.path,
+        "verify-build",
+        olderRun.id,
+      ),
+    );
+    expect(screen.getByText("较早的运行结果")).toBeInTheDocument();
+  });
+
+  it("announces task output loading states", async () => {
+    const client = createClient();
+    const run = {
+      id: "20260728T020000Z-verify-build-attempt-1-latest",
+      attempt: 1,
+      startedAt: "2026-07-28T02:00:00Z",
+    };
+    let resolveRuns!: (runs: (typeof run)[]) => void;
+    client.listTaskRuns.mockReturnValue(
+      new Promise((resolve) => {
+        resolveRuns = resolve;
+      }),
+    );
+    client.readTaskRun.mockReturnValue(new Promise(() => undefined));
+    renderQueueApp(client);
+    await screen.findByText("验证跨平台构建");
+
+    fireEvent.pointerDown(
+      screen.getByRole("button", {
+        name: "验证跨平台构建的更多操作",
+      }),
+      { button: 0, ctrlKey: false },
+    );
+    fireEvent.click(await screen.findByRole("menuitem", { name: "查看输出" }));
+
+    expect(await screen.findByLabelText("正在加载运行记录")).toHaveAttribute(
+      "aria-busy",
+      "true",
+    );
+
+    await act(async () => resolveRuns([run]));
+
+    expect(await screen.findByLabelText("正在加载运行输出")).toHaveAttribute(
+      "aria-busy",
+      "true",
+    );
+  });
+
+  it("locks the task ID after the task has produced run history", async () => {
+    const client = createClient();
+    renderQueueApp(client);
+    await screen.findByText("验证跨平台构建");
+
+    fireEvent.pointerDown(
+      screen.getByRole("button", {
+        name: "验证跨平台构建的更多操作",
+      }),
+      { button: 0, ctrlKey: false },
+    );
+    fireEvent.click(await screen.findByRole("menuitem", { name: "编辑任务" }));
+
+    expect(screen.getByLabelText("任务 ID")).toBeDisabled();
+  });
+
   it("runs the queue and refreshes the snapshot", async () => {
     const client = createClient();
     renderQueueApp(client);
@@ -156,10 +385,10 @@ describe("QueueApp", () => {
     await screen.findByText("准备发布说明");
 
     fireEvent.click(screen.getByRole("button", { name: "新建任务" }));
-    fireEvent.change(screen.getByLabelText("任务 ID"), {
+    fireEvent.change(await screen.findByLabelText("任务 ID"), {
       target: { value: "publish-release" },
     });
-    fireEvent.change(screen.getByLabelText("标题"), {
+    fireEvent.change(await screen.findByLabelText("标题"), {
       target: { value: "发布桌面版本" },
     });
     fireEvent.change(screen.getByLabelText("工作区"), {
@@ -201,7 +430,7 @@ describe("QueueApp", () => {
       { button: 0, ctrlKey: false },
     );
     fireEvent.click(await screen.findByRole("menuitem", { name: "编辑任务" }));
-    fireEvent.change(screen.getByLabelText("标题"), {
+    fireEvent.change(await screen.findByLabelText("标题"), {
       target: { value: "整理并校对发布说明" },
     });
     fireEvent.click(screen.getByRole("button", { name: "保存任务" }));
@@ -220,6 +449,7 @@ describe("QueueApp", () => {
 
   it("updates blocked dependency metadata when a failed task ID changes", async () => {
     const client = createClient();
+    client.listTaskRuns.mockResolvedValue([]);
     const failedParent = {
       ...queue.tasks[0],
       status: "failed" as const,
@@ -261,7 +491,7 @@ describe("QueueApp", () => {
       { button: 0, ctrlKey: false },
     );
     fireEvent.click(await screen.findByRole("menuitem", { name: "编辑任务" }));
-    fireEvent.change(screen.getByLabelText("任务 ID"), {
+    fireEvent.change(await screen.findByLabelText("任务 ID"), {
       target: { value: "renamed-parent" },
     });
     fireEvent.click(screen.getByRole("button", { name: "保存任务" }));
@@ -510,22 +740,46 @@ describe("QueueApp", () => {
 
     expect(await screen.findByText("正在运行队列…")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "队列设置" })).toBeDisabled();
+    const taskActions = screen.getByRole("button", {
+      name: "准备发布说明的更多操作",
+    });
+    expect(taskActions).toBeEnabled();
+    fireEvent.pointerDown(taskActions, { button: 0, ctrlKey: false });
+    const viewOutput = await screen.findByRole("menuitem", {
+      name: "查看输出",
+    });
+    expect(viewOutput).not.toHaveAttribute("data-disabled");
+    expect(screen.getByRole("menuitem", { name: "编辑任务" })).toHaveAttribute(
+      "data-disabled",
+    );
+    expect(screen.getByRole("menuitem", { name: "删除任务" })).toHaveAttribute(
+      "data-disabled",
+    );
+    fireEvent.click(viewOutput);
     expect(
-      screen.getByRole("button", { name: "准备发布说明的更多操作" }),
-    ).toBeDisabled();
+      await screen.findByRole("heading", { name: "任务输出" }),
+    ).toBeInTheDocument();
     await waitFor(
       () => expect(client.loadQueue.mock.calls.length).toBeGreaterThan(1),
       {
         timeout: 2_000,
       },
     );
+    fireEvent.click(screen.getByRole("button", { name: "关闭" }));
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("heading", { name: "任务输出" }),
+      ).not.toBeInTheDocument(),
+    );
 
-    finishRun({
-      plannedIds: ["prepare-release"],
-      succeededIds: ["prepare-release"],
-      failedIds: [],
-      blockedIds: [],
-    });
+    await act(async () =>
+      finishRun({
+        plannedIds: ["prepare-release"],
+        succeededIds: ["prepare-release"],
+        failedIds: [],
+        blockedIds: [],
+      }),
+    );
     await waitFor(() =>
       expect(screen.getByRole("button", { name: "运行队列" })).toBeEnabled(),
     );
@@ -721,7 +975,7 @@ describe("QueueApp", () => {
     fireEvent.click(await screen.findByRole("menuitem", { name: "编辑任务" }));
 
     expect(
-      screen.getByRole("checkbox", { name: /验证跨平台构建/ }),
+      await screen.findByRole("checkbox", { name: /验证跨平台构建/ }),
     ).toBeDisabled();
     expect(screen.getByText("会形成循环依赖")).toBeInTheDocument();
   });
@@ -779,7 +1033,7 @@ describe("QueueApp", () => {
       { button: 0, ctrlKey: false },
     );
     fireEvent.click(await screen.findByRole("menuitem", { name: "编辑任务" }));
-    fireEvent.change(screen.getByLabelText("标题"), {
+    fireEvent.change(await screen.findByLabelText("标题"), {
       target: { value: "陈旧编辑不应覆盖状态" },
     });
     fireEvent(window, new Event("focus"));
@@ -870,7 +1124,7 @@ describe("QueueApp", () => {
       { button: 0, ctrlKey: false },
     );
     fireEvent.click(await screen.findByRole("menuitem", { name: "编辑任务" }));
-    fireEvent.change(screen.getByLabelText("标题"), {
+    fireEvent.change(await screen.findByLabelText("标题"), {
       target: { value: "保存后的新标题" },
     });
     fireEvent.click(screen.getByRole("button", { name: "保存任务" }));
@@ -898,7 +1152,7 @@ describe("QueueApp", () => {
       { button: 0, ctrlKey: false },
     );
     fireEvent.click(await screen.findByRole("menuitem", { name: "编辑任务" }));
-    fireEvent.change(screen.getByLabelText("标题"), {
+    fireEvent.change(await screen.findByLabelText("标题"), {
       target: { value: "编辑器中的草稿标题" },
     });
 

@@ -12,6 +12,11 @@ class TestResizeObserver implements ResizeObserver {
 
 globalThis.ResizeObserver = TestResizeObserver;
 
+Object.defineProperty(Element.prototype, "scrollIntoView", {
+  configurable: true,
+  value: () => undefined,
+});
+
 Object.defineProperty(window, "matchMedia", {
   writable: true,
   value: (query: string): MediaQueryList => ({

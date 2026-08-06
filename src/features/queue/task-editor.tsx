@@ -37,12 +37,14 @@ export function TaskEditor({
   open,
   task,
   tasks,
+  idLocked = false,
   onOpenChange,
   onSave,
 }: {
   open: boolean;
   task?: Task;
   tasks: Task[];
+  idLocked?: boolean;
   onOpenChange: (open: boolean) => void;
   onSave: (task: Task, previousId?: string) => Promise<boolean>;
 }) {
@@ -117,7 +119,10 @@ export function TaskEditor({
                   label={t("task.id")}
                   value={draft.id}
                   error={errors.id}
-                  description={t("task.idHint")}
+                  description={t(
+                    idLocked ? "task.idLockedHint" : "task.idHint",
+                  )}
+                  disabled={idLocked}
                   onChange={update}
                 />
                 <TaskField
@@ -222,6 +227,7 @@ function TaskField({
   value,
   error,
   description,
+  disabled = false,
   type = "text",
   onChange,
 }: {
@@ -230,6 +236,7 @@ function TaskField({
   value: string;
   error?: string;
   description?: string;
+  disabled?: boolean;
   type?: "text" | "number";
   onChange: (field: TaskDraftField, value: string) => void;
 }) {
@@ -238,12 +245,13 @@ function TaskField({
   const descriptionId = `${inputId}-description`;
   const errorId = `${inputId}-error`;
   return (
-    <Field data-invalid={Boolean(error)}>
+    <Field data-invalid={Boolean(error)} data-disabled={disabled}>
       <FieldLabel htmlFor={inputId}>{label}</FieldLabel>
       <Input
         id={inputId}
         type={type}
         value={value}
+        disabled={disabled}
         onChange={(event) => onChange(field, event.target.value)}
         aria-invalid={Boolean(error)}
         aria-describedby={description ? descriptionId : undefined}

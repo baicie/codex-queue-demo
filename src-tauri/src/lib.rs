@@ -11,7 +11,9 @@ pub fn run() {
             commands::app_info,
             commands::load_queue,
             commands::save_queue,
-            commands::run_queue
+            commands::run_queue,
+            commands::list_task_runs,
+            commands::read_task_run
         ])
         .run(tauri::generate_context!())
         .expect("error while running Codex Queue");

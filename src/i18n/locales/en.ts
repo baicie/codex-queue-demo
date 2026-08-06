@@ -81,6 +81,7 @@ export const en = {
       edit: "Edit task",
       delete: "Delete task",
       requeue: "Requeue",
+      viewOutput: "View output",
       deleteTitle: "Delete task?",
       deleteDescription:
         'Delete task "{{title}}"? This action cannot be undone.',
@@ -103,6 +104,7 @@ export const en = {
       cancel: "Cancel",
       idHint:
         "Use only letters, numbers, hyphens, and underscores. The ID must be unique in this queue.",
+      idLockedHint: "The task ID cannot change after a run is recorded.",
       untitled: "Untitled task",
       fields: {
         id: "Task ID",
@@ -158,6 +160,30 @@ export const en = {
         promptRequired: "Enter a task prompt",
         dependencySelf: "A task cannot depend on itself",
         priorityInvalid: "Priority must be an integer",
+      },
+    },
+    runOutput: {
+      title: "Task output",
+      description: 'View background runs for "{{title}}".',
+      run: "Run",
+      refresh: "Refresh task output",
+      loadingRuns: "Loading run history",
+      loadingOutput: "Loading run output",
+      attempt: "Attempt {{attempt}} · {{startedAt}}",
+      loadError: "Unable to read task output",
+      emptyTitle: "No runs yet",
+      emptyDescription:
+        "Run the queue manually or wait for the scheduled worker, then check again.",
+      truncated: "Long output was truncated",
+      tabs: {
+        finalOutput: "Final result",
+        events: "Events",
+        stderr: "Error output",
+      },
+      empty: {
+        finalOutput: "No final result",
+        events: "No events recorded",
+        stderr: "No error output",
       },
     },
     retryPolicy: {

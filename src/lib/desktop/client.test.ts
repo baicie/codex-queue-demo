@@ -48,12 +48,35 @@ describe("desktopClient in Tauri", () => {
         succeededIds: [],
         failedIds: [],
         blockedIds: [],
+      })
+      .mockResolvedValueOnce([
+        {
+          id: "20260730T020000Z-task-a-attempt-2-newer",
+          attempt: 2,
+          startedAt: "2026-07-30T02:00:00Z",
+        },
+      ])
+      .mockResolvedValueOnce({
+        run: {
+          id: "20260730T020000Z-task-a-attempt-2-newer",
+          attempt: 2,
+          startedAt: "2026-07-30T02:00:00Z",
+        },
+        finalOutput: { content: "done", truncated: false },
+        events: { content: "{}\n", truncated: false },
+        stderr: { content: "", truncated: false },
       });
 
     await desktopClient.getAppInfo();
     await desktopClient.loadQueue(snapshot.path);
     await desktopClient.saveQueue(snapshot.path, queue, snapshot.revision);
     await desktopClient.runQueue(snapshot.path, "/opt/codex");
+    await desktopClient.listTaskRuns(snapshot.path, "task-a");
+    await desktopClient.readTaskRun(
+      snapshot.path,
+      "task-a",
+      "20260730T020000Z-task-a-attempt-2-newer",
+    );
 
     expect(invokeMock.mock.calls).toEqual([
       ["app_info"],
@@ -68,6 +91,15 @@ describe("desktopClient in Tauri", () => {
         },
       ],
       ["run_queue", { path: snapshot.path, codexBin: "/opt/codex" }],
+      ["list_task_runs", { path: snapshot.path, taskId: "task-a" }],
+      [
+        "read_task_run",
+        {
+          path: snapshot.path,
+          taskId: "task-a",
+          runId: "20260730T020000Z-task-a-attempt-2-newer",
+        },
+      ],
     ]);
   });
 
@@ -237,11 +269,89 @@ describe("desktopClient in a browser", () => {
 
     const summary = await desktopClient.runQueue(defaultQueuePath);
     const after = await desktopClient.loadQueue(defaultQueuePath);
+    const completedTask = after.queue.tasks[0];
+    const runs = await desktopClient.listTaskRuns(
+      defaultQueuePath,
+      completedTask.id,
+    );
+    expect(runs).toHaveLength(1);
+    const output = await desktopClient.readTaskRun(
+      defaultQueuePath,
+      completedTask.id,
+      runs[0].id,
+    );
 
     expect(summary.plannedIds).toEqual(before.orderedIds);
     expect(summary.succeededIds).toEqual(before.orderedIds);
     expect(after.queue.tasks.every((task) => task.status === "succeeded")).toBe(
       true,
+    );
+    expect(runs).toEqual([
+      expect.objectContaining({
+        attempt: 1,
+        startedAt: completedTask.finishedAt,
+      }),
+    ]);
+    expect(output.finalOutput.content).toContain('"mode": "browser-demo"');
+    expect(output.events.content).toContain('"type":"task.completed"');
+    expect(output.stderr.content).toBe("");
+  });
+
+  it("does not expose browser runs after a task ID is recreated", async () => {
+    const { defaultQueuePath } = await desktopClient.getAppInfo();
+    await desktopClient.runQueue(defaultQueuePath);
+    const completed = await desktopClient.loadQueue(defaultQueuePath);
+    const task = completed.queue.tasks[0];
+    const [oldRun] = await desktopClient.listTaskRuns(
+      defaultQueuePath,
+      task.id,
+    );
+    const recreatedQueue = {
+      ...completed.queue,
+      tasks: completed.queue.tasks.map((candidate) =>
+        candidate.id === task.id
+          ? { ...candidate, createdAt: "2099-01-01T00:00:00Z" }
+          : candidate,
+      ),
+    };
+
+    await desktopClient.saveQueue(
+      defaultQueuePath,
+      recreatedQueue,
+      completed.revision,
+    );
+
+    await expect(
+      desktopClient.listTaskRuns(defaultQueuePath, task.id),
+    ).resolves.toEqual([]);
+    await expect(
+      desktopClient.readTaskRun(
+        defaultQueuePath,
+        task.id,
+        oldRun?.id ?? "missing-run",
+      ),
+    ).rejects.toThrow(`run not found for task ${task.id}`);
+  });
+
+  it("rejects malformed browser run storage", async () => {
+    const { defaultQueuePath } = await desktopClient.getAppInfo();
+    const before = await desktopClient.loadQueue(defaultQueuePath);
+    const task = before.queue.tasks[0];
+    localStorage.setItem(
+      `codex-queue.runs:${defaultQueuePath}`,
+      JSON.stringify([{ taskId: task.id }]),
+    );
+
+    await expect(
+      desktopClient.listTaskRuns(defaultQueuePath, task.id),
+    ).rejects.toThrow("invalid browser run storage");
+    await expect(desktopClient.runQueue(defaultQueuePath)).rejects.toThrow(
+      "invalid browser run storage",
+    );
+
+    const after = await desktopClient.loadQueue(defaultQueuePath);
+    expect(after.queue.tasks.map((candidate) => candidate.status)).toEqual(
+      before.queue.tasks.map((candidate) => candidate.status),
     );
   });
 

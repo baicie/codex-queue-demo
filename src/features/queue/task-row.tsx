@@ -22,6 +22,7 @@ import { formatDateTime } from "@/i18n";
 import {
   CircleEllipsisIcon,
   Clock3Icon,
+  FileTextIcon,
   FolderIcon,
   GitBranchIcon,
   PencilIcon,
@@ -48,6 +49,7 @@ export function TaskRow({
   onEdit,
   onDelete,
   onRequeue,
+  onViewOutput,
 }: {
   task: Task;
   position?: number;
@@ -56,6 +58,7 @@ export function TaskRow({
   onEdit: (task: Task) => void;
   onDelete: (task: Task) => void;
   onRequeue: (task: Task) => void;
+  onViewOutput: (task: Task) => void;
 }) {
   const { t, i18n } = useTranslation();
   const effectiveStatus = blockedReason ? "blocked" : task.status;
@@ -90,24 +93,34 @@ export function TaskRow({
                 aria-label={t("accessibility.taskActions", {
                   title: task.title,
                 })}
-                disabled={disabled}
               >
                 <CircleEllipsisIcon />
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
               <DropdownMenuGroup>
-                <DropdownMenuItem onSelect={() => onEdit(task)}>
+                <DropdownMenuItem onSelect={() => onViewOutput(task)}>
+                  <FileTextIcon />
+                  {t("task.viewOutput")}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  disabled={disabled}
+                  onSelect={() => onEdit(task)}
+                >
                   <PencilIcon />
                   {t("toolbar.editTask")}
                 </DropdownMenuItem>
                 {canRequeue && (
-                  <DropdownMenuItem onSelect={() => onRequeue(task)}>
+                  <DropdownMenuItem
+                    disabled={disabled}
+                    onSelect={() => onRequeue(task)}
+                  >
                     <RotateCcwIcon />
                     {t("task.requeue")}
                   </DropdownMenuItem>
                 )}
                 <DropdownMenuItem
+                  disabled={disabled}
                   variant="destructive"
                   onSelect={() => onDelete(task)}
                 >

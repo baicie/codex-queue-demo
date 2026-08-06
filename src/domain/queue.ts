@@ -69,6 +69,24 @@ export interface RunSummary {
   blockedIds: string[];
 }
 
+export interface TaskRunSummary {
+  id: string;
+  attempt: number;
+  startedAt: string;
+}
+
+export interface RunArtifact {
+  content: string;
+  truncated: boolean;
+}
+
+export interface TaskRunOutput {
+  run: TaskRunSummary;
+  finalOutput: RunArtifact;
+  events: RunArtifact;
+  stderr: RunArtifact;
+}
+
 const DEFAULT_RETRY_POLICY: Readonly<RetryPolicy> = {
   maxAttempts: 4,
   initialDelaySeconds: 30,
