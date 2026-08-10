@@ -1,5 +1,5 @@
-import { QueueApp } from "@/features/queue/queue-app";
+import { SupervisorWorkspace } from "@/features/supervisor/supervisor-workspace";
 
 export default function App() {
-  return <QueueApp />;
+  return <SupervisorWorkspace />;
 }
