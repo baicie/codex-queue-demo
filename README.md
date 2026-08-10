@@ -2,10 +2,24 @@
 
 Codex Queue 是一个面向 macOS 和 Windows 11 的 Tauri 桌面任务队列。桌面端使用 React、Vite 和 shadcn/ui，默认显示中文并支持英文、浅色和深色主题；Rust 内核负责校验队列、解析依赖、按顺序执行任务，以及在网络或 API 暂时不可用时进行指数退避重试。
 
+应用首页同时提供 **Task Supervisor** 工作台，用于观察持久化的 job、thread、Thread Goal、Provider 健康状态和恢复时间线。Supervisor 的浏览器与 Tauri WebView MVP 使用本地 snapshot 适配器，可以完整演示 Provider 故障、指数退避、健康恢复、复用原 thread 创建 recovery turn，以及目标完成状态；原有任务队列仍可从侧边栏进入。
+
 这个项目提供两个入口，但共用同一份队列格式和 Rust 执行内核：
 
 - **桌面 UI**：查看、编辑和手动运行队列，适合日常交互操作。
 - **CLI + 系统调度器**：每天本地时间 01:00 自动拉起 Codex 并运行队列，适合无人值守任务。
+
+## Task Supervisor MVP
+
+Supervisor 当前包含：
+
+- 持久化 `jobId + threadId + workspace + originalGoal + status`。
+- `running -> waiting -> resuming -> completed` 的恢复状态流和有上限的指数退避。
+- Provider 健康状态、恢复时间线、Thread Goal 与 token budget 展示。
+- 故障标记、健康检查、暂停、恢复执行、目标完成和演示数据重置操作。
+- 与 Codex App Server v2 schema 对齐的 `initialize`、`thread/resume`、`thread/goal/set` 和 recovery `turn/start` JSON-RPC 请求构造器。
+
+当前 `SupervisorClient` 是本地持久化适配器，不会启动真实模型 turn。生产连接需要在 Tauri 端增加长驻 `codex app-server` 进程、JSONL 读写、审批请求处理和事件订阅，再使用 `src/lib/supervisor/app-server-protocol.ts` 中的请求构造器替换本地动作。这个边界是有意保留的：现有 MVP 可以独立验证状态机和 UI，同时不会在浏览器开发模式中意外启动 Codex 或执行工作区操作。
 
 Tauri UI 不承担后台定时唤醒。即使桌面窗口关闭，已安装的 macOS LaunchAgent 或 Windows Task Scheduler 任务仍会通过 CLI 执行队列。
 
@@ -251,8 +265,8 @@ open -b com.openai.codex
 推送与应用版本一致的 `v*` tag 会触发 `.github/workflows/release.yml`：
 
 ```bash
-git tag v0.2.3
-git push origin v0.2.3
+git tag v0.3.0-dev.0
+git push origin v0.3.0-dev.0
 ```
 
 Release workflow 只接受位于 `main` 历史上的 tag，并在任何发布构建开始前重新执行完整的前端、Rust 和调度脚本质量门。质量门通过后会生成：
