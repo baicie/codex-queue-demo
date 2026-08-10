@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing v* tag to build and publish"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -17,6 +23,7 @@ env:
   CARGO_TERM_COLOR: always
   NODE_VERSION: "24"
   RUST_VERSION: "1.88.0"
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 jobs:
   validate-release:
@@ -29,6 +36,7 @@ jobs:
       - name: Check out source and history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -45,15 +53,13 @@ jobs:
 
       - name: Bind the release to the event source commit
         id: bind-source
-        env:
-          RELEASE_SOURCE_COMMIT: ${{ github.sha }}
         shell: bash
         run: |
           git fetch --no-tags --force origin \
             "+refs/heads/main:refs/remotes/origin/main" \
-            "+refs/tags/${GITHUB_REF_NAME}:refs/codex-release/remote-tag"
+            "+refs/tags/${RELEASE_TAG}:refs/codex-release/remote-tag"
 
-          source_commit="$(git rev-parse --verify "${RELEASE_SOURCE_COMMIT}^{commit}")"
+          source_commit="$(git rev-parse --verify 'refs/codex-release/remote-tag^{commit}')"
           checkout_commit="$(git rev-parse --verify 'HEAD^{commit}')"
           tag_commit="$(git rev-parse --verify 'refs/codex-release/remote-tag^{commit}')"
 
@@ -62,7 +68,7 @@ jobs:
             exit 1
           fi
           if [[ "$tag_commit" != "$source_commit" ]]; then
-            echo "::error::Tag $GITHUB_REF_NAME resolved to $tag_commit, but this workflow was triggered for $source_commit."
+            echo "::error::Tag $RELEASE_TAG resolved to $tag_commit, but this workflow was triggered for $source_commit."
             exit 1
           fi
           if ! git merge-base --is-ancestor "$source_commit" refs/remotes/origin/main; then
@@ -79,7 +85,7 @@ jobs:
           import { execFileSync } from "node:child_process"
           import { readFileSync } from "node:fs"
 
-          const tag = process.env.GITHUB_REF_NAME
+          const tag = process.env.RELEASE_TAG
           const tauriVersion = JSON.parse(
             readFileSync("src-tauri/tauri.conf.json", "utf8"),
           ).version
@@ -121,7 +127,7 @@ jobs:
           NODE
 
       - name: Require stable macOS signing and notarization credentials
-        if: ${{ !contains(github.ref_name, '-') }}
+        if: ${{ !contains(env.RELEASE_TAG, '-') }}
         env:
           HAS_APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE != '' }}
           HAS_APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD != '' }}
@@ -158,6 +164,7 @@ jobs:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.validate-release.outputs.source_commit }}
           persist-credentials: false
 
       - name: Verify release tag still targets the source commit
@@ -166,7 +173,7 @@ jobs:
         shell: bash
         run: |
           git fetch --no-tags --force origin \
-            "+refs/tags/${GITHUB_REF_NAME}:refs/codex-release/remote-tag"
+            "+refs/tags/${RELEASE_TAG}:refs/codex-release/remote-tag"
 
           source_commit="$(git rev-parse --verify "${RELEASE_SOURCE_COMMIT}^{commit}")"
           checkout_commit="$(git rev-parse --verify 'HEAD^{commit}')"
@@ -177,7 +184,7 @@ jobs:
             exit 1
           fi
           if [[ "$tag_commit" != "$source_commit" ]]; then
-            echo "::error::Tag $GITHUB_REF_NAME moved to $tag_commit; expected $source_commit."
+            echo "::error::Tag $RELEASE_TAG moved to $tag_commit; expected $source_commit."
             exit 1
           fi
 
@@ -256,6 +263,7 @@ jobs:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.validate-release.outputs.source_commit }}
           persist-credentials: false
 
       - name: Verify release tag still targets the source commit
@@ -264,7 +272,7 @@ jobs:
         shell: bash
         run: |
           git fetch --no-tags --force origin \
-            "+refs/tags/${GITHUB_REF_NAME}:refs/codex-release/remote-tag"
+            "+refs/tags/${RELEASE_TAG}:refs/codex-release/remote-tag"
 
           source_commit="$(git rev-parse --verify "${RELEASE_SOURCE_COMMIT}^{commit}")"
           checkout_commit="$(git rev-parse --verify 'HEAD^{commit}')"
@@ -275,7 +283,7 @@ jobs:
             exit 1
           fi
           if [[ "$tag_commit" != "$source_commit" ]]; then
-            echo "::error::Tag $GITHUB_REF_NAME moved to $tag_commit; expected $source_commit."
+            echo "::error::Tag $RELEASE_TAG moved to $tag_commit; expected $source_commit."
             exit 1
           fi
 
@@ -352,6 +360,7 @@ jobs:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.validate-release.outputs.source_commit }}
           persist-credentials: false
 
       - name: Verify release tag still targets the source commit
@@ -360,7 +369,7 @@ jobs:
         shell: bash
         run: |
           git fetch --no-tags --force origin \
-            "+refs/tags/${GITHUB_REF_NAME}:refs/codex-release/remote-tag"
+            "+refs/tags/${RELEASE_TAG}:refs/codex-release/remote-tag"
 
           source_commit="$(git rev-parse --verify "${RELEASE_SOURCE_COMMIT}^{commit}")"
           checkout_commit="$(git rev-parse --verify 'HEAD^{commit}')"
@@ -371,7 +380,7 @@ jobs:
             exit 1
           fi
           if [[ "$tag_commit" != "$source_commit" ]]; then
-            echo "::error::Tag $GITHUB_REF_NAME moved to $tag_commit; expected $source_commit."
+            echo "::error::Tag $RELEASE_TAG moved to $tag_commit; expected $source_commit."
             exit 1
           fi
 
@@ -397,7 +406,7 @@ jobs:
         run: npm ci
 
       - name: Build signed and notarized macOS installer bundles
-        if: ${{ matrix.platform == 'macos' && !contains(github.ref_name, '-') }}
+        if: ${{ matrix.platform == 'macos' && !contains(env.RELEASE_TAG, '-') }}
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -407,7 +416,7 @@ jobs:
         run: npm run tauri build -- --target "${{ matrix.target }}"
 
       - name: Build unsigned macOS prerelease DMG
-        if: ${{ matrix.platform == 'macos' && contains(github.ref_name, '-') }}
+        if: ${{ matrix.platform == 'macos' && contains(env.RELEASE_TAG, '-') }}
         run: npm run tauri build -- --target "${{ matrix.target }}" --bundles dmg --no-sign
 
       - name: Resolve Windows bundle version
@@ -435,7 +444,7 @@ jobs:
         if: matrix.platform == 'macos'
         env:
           EXPECTED_ARCH: ${{ matrix.expected-arch }}
-          REQUIRE_DISTRIBUTION_TRUST: ${{ !contains(github.ref_name, '-') }}
+          REQUIRE_DISTRIBUTION_TRUST: ${{ !contains(env.RELEASE_TAG, '-') }}
         shell: bash
         run: |
           shopt -s nullglob
@@ -516,13 +525,13 @@ jobs:
           }
 
           mkdir -p release-assets scheduler-package
-          cp "${dmg_files[0]}" "release-assets/codex-queue-${GITHUB_REF_NAME}-${{ matrix.asset-suffix }}.dmg"
+          cp "${dmg_files[0]}" "release-assets/codex-queue-${RELEASE_TAG}-${{ matrix.asset-suffix }}.dmg"
           cp "$binary" scheduler-package/codex-queue-demo
           cp scripts/install-macos.sh scripts/uninstall-macos.sh LICENSE scheduler-package/
           chmod +x scheduler-package/codex-queue-demo scheduler-package/*.sh
           (
             cd scheduler-package
-            /usr/bin/zip -r -X "../release-assets/codex-queue-scheduler-${GITHUB_REF_NAME}-${{ matrix.asset-suffix }}.zip" .
+            /usr/bin/zip -r -X "../release-assets/codex-queue-scheduler-${RELEASE_TAG}-${{ matrix.asset-suffix }}.zip" .
           )
 
       - name: Stage Windows release assets
@@ -551,11 +560,11 @@ jobs:
           }
 
           New-Item -ItemType Directory -Path release-assets, scheduler-package -Force | Out-Null
-          Copy-Item -LiteralPath $msiFiles[0].FullName -Destination "release-assets/codex-queue-$env:GITHUB_REF_NAME-${{ matrix.asset-suffix }}.msi"
-          Copy-Item -LiteralPath $nsisFiles[0].FullName -Destination "release-assets/codex-queue-$env:GITHUB_REF_NAME-${{ matrix.asset-suffix }}-setup.exe"
+          Copy-Item -LiteralPath $msiFiles[0].FullName -Destination "release-assets/codex-queue-$env:RELEASE_TAG-${{ matrix.asset-suffix }}.msi"
+          Copy-Item -LiteralPath $nsisFiles[0].FullName -Destination "release-assets/codex-queue-$env:RELEASE_TAG-${{ matrix.asset-suffix }}-setup.exe"
           Copy-Item -LiteralPath $binary -Destination scheduler-package/codex-queue-demo.exe
           Copy-Item -LiteralPath scripts/install-windows.ps1, scripts/uninstall-windows.ps1, LICENSE -Destination scheduler-package/
-          Compress-Archive -Path scheduler-package/* -DestinationPath "release-assets/codex-queue-scheduler-$env:GITHUB_REF_NAME-${{ matrix.asset-suffix }}.zip"
+          Compress-Archive -Path scheduler-package/* -DestinationPath "release-assets/codex-queue-scheduler-$env:RELEASE_TAG-${{ matrix.asset-suffix }}.zip"
 
       - name: Upload staged release assets
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -591,13 +600,13 @@ jobs:
         shell: bash
         run: |
           expected=(
-            "release-assets/codex-queue-${GITHUB_REF_NAME}-macos-aarch64.dmg"
-            "release-assets/codex-queue-${GITHUB_REF_NAME}-macos-x86_64.dmg"
-            "release-assets/codex-queue-${GITHUB_REF_NAME}-windows-x86_64.msi"
-            "release-assets/codex-queue-${GITHUB_REF_NAME}-windows-x86_64-setup.exe"
-            "release-assets/codex-queue-scheduler-${GITHUB_REF_NAME}-macos-aarch64.zip"
-            "release-assets/codex-queue-scheduler-${GITHUB_REF_NAME}-macos-x86_64.zip"
-            "release-assets/codex-queue-scheduler-${GITHUB_REF_NAME}-windows-x86_64.zip"
+            "release-assets/codex-queue-${RELEASE_TAG}-macos-aarch64.dmg"
+            "release-assets/codex-queue-${RELEASE_TAG}-macos-x86_64.dmg"
+            "release-assets/codex-queue-${RELEASE_TAG}-windows-x86_64.msi"
+            "release-assets/codex-queue-${RELEASE_TAG}-windows-x86_64-setup.exe"
+            "release-assets/codex-queue-scheduler-${RELEASE_TAG}-macos-aarch64.zip"
+            "release-assets/codex-queue-scheduler-${RELEASE_TAG}-macos-x86_64.zip"
+            "release-assets/codex-queue-scheduler-${RELEASE_TAG}-windows-x86_64.zip"
           )
 
           for asset in "${expected[@]}"; do
@@ -623,7 +632,7 @@ jobs:
           RELEASE_SOURCE_COMMIT: ${{ needs.validate-release.outputs.source_commit }}
         shell: bash
         run: |
-          tag="$GITHUB_REF_NAME"
+          tag="$RELEASE_TAG"
           assets=(release-assets/*)
           notes_file="$RUNNER_TEMP/release-notes.md"
           cat > "$notes_file" <<'EOF'
