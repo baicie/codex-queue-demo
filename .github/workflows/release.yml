@@ -403,9 +403,26 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: npm run tauri build -- --target "${{ matrix.target }}"
 
+      - name: Resolve Windows bundle version
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $version = node --print "require('./package.json').version"
+          $baseVersion = $version.Split('-')[0]
+          if ($baseVersion -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Cannot derive a Windows bundle version from $version"
+          }
+
+          $configPath = Join-Path $env:RUNNER_TEMP 'tauri-windows-bundle.conf.json'
+          @{ version = "$baseVersion-0" } |
+            ConvertTo-Json -Compress |
+            Set-Content -LiteralPath $configPath -Encoding utf8
+          "TAURI_WINDOWS_BUNDLE_CONFIG=$configPath" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Build Windows installer bundles
         if: matrix.platform == 'windows'
-        run: npm run tauri build -- --target "${{ matrix.target }}"
+        run: npm run tauri build -- --target "${{ matrix.target }}" --config "$env:TAURI_WINDOWS_BUNDLE_CONFIG"
 
       - name: Verify macOS distribution trust
         if: matrix.platform == 'macos'
