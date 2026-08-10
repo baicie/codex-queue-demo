@@ -46,7 +46,10 @@ class LocalSupervisorClient implements SupervisorClient {
     });
   }
 
-  async markProviderDown(jobId: string, now = new Date()): Promise<SupervisorSnapshot> {
+  async markProviderDown(
+    jobId: string,
+    now = new Date(),
+  ): Promise<SupervisorSnapshot> {
     return this.mutate((snapshot) => markProviderDown(snapshot, jobId, now));
   }
 
@@ -54,7 +57,10 @@ class LocalSupervisorClient implements SupervisorClient {
     return this.mutate((snapshot) => markProviderHealthy(snapshot, now));
   }
 
-  async resumeJob(jobId: string, now = new Date()): Promise<SupervisorSnapshot> {
+  async resumeJob(
+    jobId: string,
+    now = new Date(),
+  ): Promise<SupervisorSnapshot> {
     return this.mutate((snapshot) => resumeSupervisorJob(snapshot, jobId, now));
   }
 
@@ -62,8 +68,13 @@ class LocalSupervisorClient implements SupervisorClient {
     return this.mutate((snapshot) => pauseSupervisorJob(snapshot, jobId, now));
   }
 
-  async completeGoal(jobId: string, now = new Date()): Promise<SupervisorSnapshot> {
-    return this.mutate((snapshot) => completeSupervisorGoal(snapshot, jobId, now));
+  async completeGoal(
+    jobId: string,
+    now = new Date(),
+  ): Promise<SupervisorSnapshot> {
+    return this.mutate((snapshot) =>
+      completeSupervisorGoal(snapshot, jobId, now),
+    );
   }
 
   async resetDemo(now = new Date()): Promise<SupervisorSnapshot> {
@@ -73,7 +84,9 @@ class LocalSupervisorClient implements SupervisorClient {
   private async mutate(
     transition: (snapshot: SupervisorSnapshot) => SupervisorSnapshot,
   ): Promise<SupervisorSnapshot> {
-    return withSupervisorLock(() => persistSnapshot(transition(loadSnapshot())));
+    return withSupervisorLock(() =>
+      persistSnapshot(transition(loadSnapshot())),
+    );
   }
 }
 
@@ -87,12 +100,15 @@ function loadSnapshot(): SupervisorSnapshot {
   try {
     value = JSON.parse(input);
   } catch (error) {
-    throw new Error("cannot read the local supervisor snapshot", { cause: error });
+    throw new Error("cannot read the local supervisor snapshot", {
+      cause: error,
+    });
   }
-  if (!isSupervisorSnapshot(value)) {
+  const migrated = migrateLegacyGoalStatus(value);
+  if (!isSupervisorSnapshot(migrated.value)) {
     throw new Error("the local supervisor snapshot is invalid");
   }
-  return value;
+  return migrated.changed ? persistSnapshot(migrated.value) : migrated.value;
 }
 
 function persistSnapshot(snapshot: SupervisorSnapshot): SupervisorSnapshot {
@@ -104,7 +120,9 @@ function persistSnapshot(snapshot: SupervisorSnapshot): SupervisorSnapshot {
   return JSON.parse(serialized) as SupervisorSnapshot;
 }
 
-async function withSupervisorLock<T>(action: () => T | PromiseLike<T>): Promise<T> {
+async function withSupervisorLock<T>(
+  action: () => T | PromiseLike<T>,
+): Promise<T> {
   const locks = globalThis.navigator?.locks;
   if (locks) {
     return locks.request(LOCK_NAME, { mode: "exclusive" }, () => action());
@@ -136,6 +154,29 @@ function isSupervisorSnapshot(value: unknown): value is SupervisorSnapshot {
   );
 }
 
+function migrateLegacyGoalStatus(value: unknown): {
+  value: unknown;
+  changed: boolean;
+} {
+  if (!isRecord(value) || !Array.isArray(value.jobs)) {
+    return { value, changed: false };
+  }
+
+  let changed = false;
+  const jobs = value.jobs.map((job) => {
+    if (
+      !isRecord(job) ||
+      !isRecord(job.goal) ||
+      job.goal.status !== "completed"
+    ) {
+      return job;
+    }
+    changed = true;
+    return { ...job, goal: { ...job.goal, status: "complete" } };
+  });
+  return changed ? { value: { ...value, jobs }, changed } : { value, changed };
+}
+
 function isProviderHealth(value: unknown): boolean {
   return (
     isRecord(value) &&
@@ -159,7 +200,14 @@ function isSupervisorJob(value: unknown): value is SupervisorJob {
     typeof value.originalGoal === "string" &&
     isRecord(value.goal) &&
     typeof value.goal.objective === "string" &&
-    ["active", "completed", "paused"].includes(String(value.goal.status)) &&
+    [
+      "active",
+      "paused",
+      "blocked",
+      "usageLimited",
+      "budgetLimited",
+      "complete",
+    ].includes(String(value.goal.status)) &&
     isNonNegativeInteger(value.goal.tokenBudget) &&
     SUPERVISOR_STATUSES.includes(value.status as SupervisorJob["status"]) &&
     isNonNegativeInteger(value.attempts) &&

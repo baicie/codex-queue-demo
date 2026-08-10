@@ -10,7 +10,13 @@ export const SUPERVISOR_STATUSES = [
 ] as const;
 
 export type SupervisorStatus = (typeof SUPERVISOR_STATUSES)[number];
-export type GoalStatus = "active" | "completed" | "paused";
+export type GoalStatus =
+  | "active"
+  | "paused"
+  | "blocked"
+  | "usageLimited"
+  | "budgetLimited"
+  | "complete";
 export type ProviderState = "healthy" | "degraded" | "offline";
 export type SupervisorEventKind =
   | "job_created"
@@ -102,9 +108,27 @@ export function createDemoSupervisor(now = new Date()): SupervisorSnapshot {
     updatedAt: new Date(now.getTime() - 2 * 60_000).toISOString(),
     startedAt: new Date(now.getTime() - 38 * 60_000).toISOString(),
     events: [
-      event("job_created", "任务已创建", "保存 job、thread 和工作区上下文。", now, -38),
-      event("turn_started", "Turn 1 已开始", "Codex 正在检查当前工作区和迁移计划。", now, -34),
-      event("turn_started", "Turn 3 执行中", "正在等待 provider 返回下一段模型输出。", now, -2),
+      event(
+        "job_created",
+        "任务已创建",
+        "保存 job、thread 和工作区上下文。",
+        now,
+        -38,
+      ),
+      event(
+        "turn_started",
+        "Turn 1 已开始",
+        "Codex 正在检查当前工作区和迁移计划。",
+        now,
+        -34,
+      ),
+      event(
+        "turn_started",
+        "Turn 3 执行中",
+        "正在等待 provider 返回下一段模型输出。",
+        now,
+        -2,
+      ),
     ],
   });
   const docsJob = createJob({
@@ -123,10 +147,34 @@ export function createDemoSupervisor(now = new Date()): SupervisorSnapshot {
     nextRetryAt: new Date(now.getTime() + 56_000).toISOString(),
     lastError: "Provider request timed out after 300s",
     events: [
-      event("job_created", "任务已创建", "原始目标已保存到 Supervisor。", now, -180),
-      event("turn_started", "Turn 2 已开始", "已读取上一轮的工作区变更。", now, -12),
-      event("provider_down", "Provider 暂时不可用", "请求超时，等待中转站恢复。", now, -4),
-      event("retry_scheduled", "已安排下一次探测", "指数退避等待 60 秒。", now, -4),
+      event(
+        "job_created",
+        "任务已创建",
+        "原始目标已保存到 Supervisor。",
+        now,
+        -180,
+      ),
+      event(
+        "turn_started",
+        "Turn 2 已开始",
+        "已读取上一轮的工作区变更。",
+        now,
+        -12,
+      ),
+      event(
+        "provider_down",
+        "Provider 暂时不可用",
+        "请求超时，等待中转站恢复。",
+        now,
+        -4,
+      ),
+      event(
+        "retry_scheduled",
+        "已安排下一次探测",
+        "指数退避等待 60 秒。",
+        now,
+        -4,
+      ),
     ],
   });
   const completedJob = createJob({
@@ -135,6 +183,7 @@ export function createDemoSupervisor(now = new Date()): SupervisorSnapshot {
     threadId: "thr_dependency_audit",
     workspace: "~/Workspace/atlas-web",
     originalGoal: "完成依赖审计并记录需要处理的风险。",
+    goalStatus: "complete",
     status: "completed",
     attempts: 1,
     maxAttempts: 4,
@@ -145,7 +194,13 @@ export function createDemoSupervisor(now = new Date()): SupervisorSnapshot {
     finishedAt: new Date(now.getTime() - 20 * 60_000).toISOString(),
     events: [
       event("job_created", "任务已创建", "目标和 thread 已持久化。", now, -480),
-      event("turn_started", "Turn 1 已完成", "已完成依赖扫描和结果汇总。", now, -30),
+      event(
+        "turn_started",
+        "Turn 1 已完成",
+        "已完成依赖扫描和结果汇总。",
+        now,
+        -30,
+      ),
       event("goal_completed", "目标已完成", "所有验证步骤均已通过。", now, -20),
     ],
   });
@@ -171,8 +226,13 @@ export function markProviderDown(
   now = new Date(),
 ): SupervisorSnapshot {
   const job = requireJob(snapshot, jobId);
+  if (job.status === "completed") {
+    throw new Error("completed job cannot enter provider recovery");
+  }
   const retrySeconds = retryDelaySeconds(job.recoveryCount + 1);
-  const nextRetryAt = new Date(now.getTime() + retrySeconds * 1000).toISOString();
+  const nextRetryAt = new Date(
+    now.getTime() + retrySeconds * 1000,
+  ).toISOString();
   const updatedJob = updateJob(job, {
     status: "waiting",
     recoveryCount: job.recoveryCount + 1,
@@ -250,8 +310,12 @@ export function resumeSupervisorJob(
   if (snapshot.provider.state === "offline") {
     throw new Error("provider is still offline");
   }
+  if (!["waiting", "provider_down", "paused", "failed"].includes(job.status)) {
+    throw new Error(`job ${jobId} is not waiting for recovery`);
+  }
   const updatedJob = updateJob(job, {
     status: "resuming",
+    goal: { ...job.goal, status: "active" },
     attempts: job.attempts + 1,
     turnCount: job.turnCount + 1,
     nextRetryAt: undefined,
@@ -282,7 +346,7 @@ export function completeSupervisorGoal(
     updatedAt: now.toISOString(),
     nextRetryAt: undefined,
     lastError: undefined,
-    goal: { ...job.goal, status: "completed" },
+    goal: { ...job.goal, status: "complete" },
     events: [
       ...job.events,
       makeEvent(
@@ -302,9 +366,13 @@ export function pauseSupervisorJob(
   now = new Date(),
 ): SupervisorSnapshot {
   const job = requireJob(snapshot, jobId);
+  if (job.status === "completed") {
+    throw new Error("completed job cannot be paused");
+  }
   const updatedJob = updateJob(job, {
     status: "paused",
     updatedAt: now.toISOString(),
+    nextRetryAt: undefined,
     goal: { ...job.goal, status: "paused" },
     events: [
       ...job.events,
@@ -328,8 +396,10 @@ export function summarizeSupervisor(
 ): SupervisorSummary {
   return snapshot.jobs.reduce<SupervisorSummary>(
     (summary, job) => {
-      if (["running", "resuming", "queued"].includes(job.status)) summary.active += 1;
-      if (["waiting", "provider_down"].includes(job.status)) summary.waiting += 1;
+      if (["running", "resuming", "queued"].includes(job.status))
+        summary.active += 1;
+      if (["waiting", "provider_down"].includes(job.status))
+        summary.waiting += 1;
       if (job.status === "completed") summary.completed += 1;
       if (["failed", "paused"].includes(job.status)) summary.attention += 1;
       return summary;
@@ -338,10 +408,17 @@ export function summarizeSupervisor(
   );
 }
 
-function createJob(input: Omit<SupervisorJob, "goal" | "originalGoal"> & { originalGoal: string }): SupervisorJob {
+function createJob({
+  goalStatus = "active",
+  ...input
+}: Omit<SupervisorJob, "goal"> & { goalStatus?: GoalStatus }): SupervisorJob {
   return {
     ...input,
-    goal: { objective: input.originalGoal, status: "active", tokenBudget: 40_000 },
+    goal: {
+      objective: input.originalGoal,
+      status: goalStatus,
+      tokenBudget: 40_000,
+    },
   };
 }
 
@@ -352,11 +429,17 @@ function updateJob(
   return { ...job, ...changes };
 }
 
-function replaceJob(jobs: SupervisorJob[], updatedJob: SupervisorJob): SupervisorJob[] {
+function replaceJob(
+  jobs: SupervisorJob[],
+  updatedJob: SupervisorJob,
+): SupervisorJob[] {
   return jobs.map((job) => (job.id === updatedJob.id ? updatedJob : job));
 }
 
-function requireJob(snapshot: SupervisorSnapshot, jobId: string): SupervisorJob {
+function requireJob(
+  snapshot: SupervisorSnapshot,
+  jobId: string,
+): SupervisorJob {
   const job = snapshot.jobs.find((candidate) => candidate.id === jobId);
   if (!job) throw new Error(`supervisor job not found: ${jobId}`);
   return job;
@@ -369,7 +452,12 @@ function event(
   now: Date,
   minutesOffset: number,
 ): SupervisorEvent {
-  return makeEvent(kind, title, detail, new Date(now.getTime() + minutesOffset * 60_000));
+  return makeEvent(
+    kind,
+    title,
+    detail,
+    new Date(now.getTime() + minutesOffset * 60_000),
+  );
 }
 
 function makeEvent(
