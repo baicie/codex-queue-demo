@@ -218,7 +218,7 @@ open -b io.github.baicie.codex-queue
 open -b com.openai.codex
 ```
 
-`open` 只向 LaunchServices 请求启动应用，不会绕过 Gatekeeper。正式发布的 Codex Queue 必须通过 Developer ID 签名和 Apple notarization。
+`open` 只向 LaunchServices 请求启动应用，不会绕过 Gatekeeper。稳定正式版本的 Codex Queue 必须通过 Developer ID 签名和 Apple notarization；带 `-` 的开发预发布 DMG 可以不签名，但首次打开时需要按下文说明手动授权。
 
 卸载调度器会保留队列和运行日志：
 
@@ -276,13 +276,13 @@ Release workflow 只接受位于 `main` 历史上的 tag，并在任何发布构
 - Windows x64 MSI、NSIS installer 和 scheduler ZIP。
 - 覆盖全部安装包与 scheduler ZIP 的 `SHA256SUMS`。
 
-每个 scheduler ZIP 都包含对应平台的预编译 CLI、安装/卸载脚本和 MIT License。Workflow 会先核对预期资产并验证校验和，再发布 GitHub Release；macOS 构建还必须通过 Developer ID、hardened runtime、notary ticket、`syspolicy_check` 和 `spctl` 检查。所有第三方 Actions 都固定到经过审计的完整 commit SHA。
+每个 scheduler ZIP 都包含对应平台的预编译 CLI、安装/卸载脚本和 MIT License。Workflow 会先核对预期资产并验证校验和，再发布 GitHub Release。稳定版本的 macOS 构建必须通过 Developer ID、hardened runtime、notary ticket、`syspolicy_check` 和 `spctl` 检查；版本中带 `-` 的预发布会生成未签名 DMG，并挂载检查其中应用二进制的 `arm64` / `x86_64` 架构。所有第三方 Actions 都固定到经过审计的完整 commit SHA。
 
 当前不构建 Linux 安装包。发布前需要同步更新 `package.json`、`Cargo.toml`、`src-tauri/Cargo.toml` 和 `src-tauri/tauri.conf.json` 中的版本。
 
 ## 安装包签名说明
 
-macOS Release 中的 app bundle 强制使用 Developer ID Application 证书并完成 Apple notarization。Workflow 会只读挂载生成的 DMG 并检查其中的实际 app；缺少以下任一 GitHub Actions repository secret 时，Release 会在构建前失败。DMG 内的 app 未通过构建时的签名、公证或 Gatekeeper 检查时也不会发布：
+稳定版 macOS Release 中的 app bundle 强制使用 Developer ID Application 证书并完成 Apple notarization。Workflow 会只读挂载生成的 DMG 并检查其中的实际 app；缺少以下任一 GitHub Actions repository secret 时，稳定版 Release 会在构建前失败。DMG 内的 app 未通过构建时的签名、公证或 Gatekeeper 检查时也不会发布：
 
 - `APPLE_CERTIFICATE`：Developer ID Application `.p12` 的 Base64 内容。
 - `APPLE_CERTIFICATE_PASSWORD`：导出 `.p12` 时设置的密码。
@@ -302,7 +302,7 @@ gh secret set APPLE_TEAM_ID
 
 Apple notarization 需要付费 Apple Developer Program 账号；免费账号只能用于开发测试。证书准备和环境变量定义参见 [Tauri macOS signing](https://v2.tauri.app/distribute/sign/macos/) 与 [Tauri environment variables](https://v2.tauri.app/reference/environment-variables/)。
 
-历史版本 `v0.2.2` 使用 ad-hoc 签名且没有 notarization。其校验和正确时，可先尝试打开一次，再到“系统设置 > 隐私与安全性 > 安全性”选择“仍要打开”进行一次性授权。也可以对已核验来源的本地副本执行：
+版本中带 `-` 的开发预发布不要求这些凭据，Workflow 会使用 `--no-sign` 分别打包 Apple Silicon (`arm64`) 与 Intel (`x86_64`) DMG，并验证 DMG 内应用的芯片架构。这些 DMG 未签名且没有 notarization。核对校验和后，可先尝试打开一次，再到“系统设置 > 隐私与安全性 > 安全性”选择“仍要打开”进行一次性授权。也可以对已核验来源的本地副本执行：
 
 ```bash
 xattr -dr com.apple.quarantine "/Applications/Codex Queue.app"

@@ -120,7 +120,8 @@ jobs:
           }
           NODE
 
-      - name: Require macOS signing and notarization credentials
+      - name: Require stable macOS signing and notarization credentials
+        if: ${{ !contains(github.ref_name, '-') }}
         env:
           HAS_APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE != '' }}
           HAS_APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD != '' }}
@@ -334,11 +335,13 @@ jobs:
             os: macos-15
             platform: macos
             target: aarch64-apple-darwin
+            expected-arch: arm64
             asset-suffix: macos-aarch64
           - label: macOS Intel
             os: macos-15-intel
             platform: macos
             target: x86_64-apple-darwin
+            expected-arch: x86_64
             asset-suffix: macos-x86_64
           - label: Windows x64
             os: windows-latest
@@ -394,7 +397,7 @@ jobs:
         run: npm ci
 
       - name: Build signed and notarized macOS installer bundles
-        if: matrix.platform == 'macos'
+        if: ${{ matrix.platform == 'macos' && !contains(github.ref_name, '-') }}
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -402,6 +405,10 @@ jobs:
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: npm run tauri build -- --target "${{ matrix.target }}"
+
+      - name: Build unsigned macOS prerelease DMG
+        if: ${{ matrix.platform == 'macos' && contains(github.ref_name, '-') }}
+        run: npm run tauri build -- --target "${{ matrix.target }}" --bundles dmg --no-sign
 
       - name: Resolve Windows bundle version
         if: matrix.platform == 'windows'
@@ -424,8 +431,11 @@ jobs:
         if: matrix.platform == 'windows'
         run: npm run tauri build -- --target "${{ matrix.target }}" --config "$env:TAURI_WINDOWS_BUNDLE_CONFIG"
 
-      - name: Verify macOS distribution trust
+      - name: Verify macOS installer bundle
         if: matrix.platform == 'macos'
+        env:
+          EXPECTED_ARCH: ${{ matrix.expected-arch }}
+          REQUIRE_DISTRIBUTION_TRUST: ${{ !contains(github.ref_name, '-') }}
         shell: bash
         run: |
           shopt -s nullglob
@@ -450,24 +460,38 @@ jobs:
             exit 1
           fi
 
-          signature_info="$(codesign --display --verbose=4 "$app_bundle" 2>&1)"
-          if ! grep -q '^Authority=Developer ID Application:' <<<"$signature_info"; then
-            echo "::error::The app is not signed with a Developer ID Application certificate."
-            exit 1
-          fi
-          if ! grep -Eq '^CodeDirectory .*flags=.*runtime' <<<"$signature_info"; then
-            echo "::error::The app is not signed with hardened runtime enabled."
-            exit 1
-          fi
-          if ! grep -Eq '^TeamIdentifier=.+$' <<<"$signature_info"; then
-            echo "::error::The app signature does not include an Apple Team ID."
+          app_binary="$app_bundle/Contents/MacOS/codex-queue-desktop"
+          if [[ ! -x "$app_binary" ]]; then
+            echo "::error::The DMG does not contain the expected executable at $app_binary."
             exit 1
           fi
 
-          codesign --verify --deep --strict --verbose=4 "$app_bundle"
-          xcrun stapler validate "$app_bundle"
-          xcrun syspolicy_check distribution "$app_bundle"
-          spctl --assess --type execute --verbose=4 "$app_bundle"
+          architectures="$(lipo -archs "$app_binary")"
+          if [[ "$architectures" != "$EXPECTED_ARCH" ]]; then
+            echo "::error::Expected $EXPECTED_ARCH executable in the DMG, found: $architectures."
+            exit 1
+          fi
+
+          if [[ "$REQUIRE_DISTRIBUTION_TRUST" == "true" ]]; then
+            signature_info="$(codesign --display --verbose=4 "$app_bundle" 2>&1)"
+            if ! grep -q '^Authority=Developer ID Application:' <<<"$signature_info"; then
+              echo "::error::The app is not signed with a Developer ID Application certificate."
+              exit 1
+            fi
+            if ! grep -Eq '^CodeDirectory .*flags=.*runtime' <<<"$signature_info"; then
+              echo "::error::The app is not signed with hardened runtime enabled."
+              exit 1
+            fi
+            if ! grep -Eq '^TeamIdentifier=.+$' <<<"$signature_info"; then
+              echo "::error::The app signature does not include an Apple Team ID."
+              exit 1
+            fi
+
+            codesign --verify --deep --strict --verbose=4 "$app_bundle"
+            xcrun stapler validate "$app_bundle"
+            xcrun syspolicy_check distribution "$app_bundle"
+            spctl --assess --type execute --verbose=4 "$app_bundle"
+          fi
 
       - name: Build scheduled CLI
         run: cargo build --locked --release --package codex-queue-demo --target "${{ matrix.target }}"
@@ -606,9 +630,18 @@ jobs:
           Download the desktop installer and optional scheduler package for your platform below.
 
           Scheduler ZIP files contain the prebuilt CLI and the matching install/uninstall scripts. Verify downloads with `SHA256SUMS` before installing.
+          EOF
+          if [[ "$tag" == *-* ]]; then
+            cat >> "$notes_file" <<'EOF'
+
+          This prerelease provides unsigned, unnotarized macOS DMGs. Choose `macos-aarch64` for Apple Silicon or `macos-x86_64` for Intel. Windows installers are also not code signed; see the README for platform security prompts and limitations.
+          EOF
+          else
+            cat >> "$notes_file" <<'EOF'
 
           The app bundles inside macOS DMGs are signed with Apple Developer ID and notarized. Windows installers are not code signed; see the README for platform security prompts and limitations.
           EOF
+          fi
 
           git fetch --no-tags --force origin \
             "+refs/tags/${tag}:refs/codex-release/remote-tag"
