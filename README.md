@@ -265,14 +265,14 @@ open -b com.openai.codex
 推送与应用版本一致的 `v*` tag 会触发 `.github/workflows/release.yml`：
 
 ```bash
-git tag v0.3.0-dev.0
-git push origin v0.3.0-dev.0
+git tag v0.3.0-dev.1
+git push origin v0.3.0-dev.1
 ```
 
 如果 tag 已受仓库规则保护而需要重新发布，可从 `main` 手动运行 workflow，并将 `tag` 输入设为目标 tag：
 
 ```bash
-gh workflow run release.yml --ref main -f tag=v0.3.0-dev.0
+gh workflow run release.yml --ref main -f tag=v0.3.0-dev.1
 ```
 
 Release workflow 只接受位于 `main` 历史上的 tag，并在任何发布构建开始前重新执行完整的前端、Rust 和调度脚本质量门。质量门通过后会生成：

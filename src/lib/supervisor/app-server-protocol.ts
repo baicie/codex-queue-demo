@@ -30,7 +30,7 @@ export function createInitializeRequest(
     params: {
       clientInfo: {
         name: "codex-queue-supervisor",
-        version: "0.3.0-dev.0",
+        version: "0.3.0-dev.1",
       },
       capabilities: { experimentalApi: true },
     },
