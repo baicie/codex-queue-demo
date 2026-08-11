@@ -81,7 +81,7 @@ export function SupervisorWorkspace() {
             onClick={toggleTheme}
           />
           <span className="ml-auto text-[11px] text-muted-foreground">
-            v0.3.0-dev.1
+            v0.3.0-dev.2
           </span>
         </div>
       </aside>
