@@ -1001,9 +1001,15 @@ fn recovery_reason(
 }
 
 fn recovery_count_for_goal(goal: Option<&GoalRecord>, scan: &RolloutScan) -> u32 {
-    goal.filter(|goal| goal.created_at_ms == scan.recovery_goal_created_at_ms)
-        .map(|_| scan.recovery_turn_count)
-        .unwrap_or_default()
+    // Rollout goal events use seconds while the goals database preserves milliseconds.
+    goal.filter(|goal| {
+        goal.created_at_ms > 0
+            && scan.recovery_goal_created_at_ms > 0
+            && goal.created_at_ms.div_euclid(1_000)
+                == scan.recovery_goal_created_at_ms.div_euclid(1_000)
+    })
+    .map(|_| scan.recovery_turn_count)
+    .unwrap_or_default()
 }
 
 fn retry_delay_seconds(attempt: u32) -> i64 {
@@ -1295,6 +1301,19 @@ mod tests {
 
         scan.recovery_goal_created_at_ms = 2_000;
         assert_eq!(recovery_count_for_goal(Some(&goal), &scan), 0);
+    }
+
+    #[test]
+    fn recovery_attempts_match_database_milliseconds_to_rollout_seconds() {
+        let scan = RolloutScan {
+            recovery_turn_count: 6,
+            recovery_goal_created_at_ms: 1_786_423_719_000,
+            ..RolloutScan::default()
+        };
+        let mut goal = test_goal("active");
+        goal.created_at_ms = 1_786_423_719_052;
+
+        assert_eq!(recovery_count_for_goal(Some(&goal), &scan), 6);
     }
 
     #[test]
