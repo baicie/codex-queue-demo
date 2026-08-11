@@ -60,6 +60,38 @@ fn passes_prompt_over_stdin_and_records_codex_outputs() {
 }
 
 #[test]
+fn resumes_the_existing_thread_non_interactively() {
+    let temp = TempDir::new().expect("temp directory");
+    let fake_codex = compile_fake_codex(temp.path());
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let codex = CodexCli::new(fake_codex);
+
+    codex
+        .resume_thread(
+            "019feeb5-ee22-7a81-b9a0-86d90b35eaa0",
+            &workspace,
+            "Continue the existing goal",
+        )
+        .expect("fake Codex resume succeeds");
+
+    let arguments = fs::read_to_string(workspace.join("resume-args.txt")).unwrap();
+    assert!(arguments.lines().any(|argument| argument == "exec"));
+    assert!(arguments.lines().any(|argument| argument == "resume"));
+    assert!(
+        arguments
+            .lines()
+            .any(|argument| argument == "019feeb5-ee22-7a81-b9a0-86d90b35eaa0")
+    );
+    assert!(!arguments.lines().any(|argument| argument == "--ephemeral"));
+    assert_eq!(arguments.lines().last(), Some("-"));
+    assert_eq!(
+        fs::read_to_string(workspace.join("resume-prompt.txt")).unwrap(),
+        "Continue the existing goal\n"
+    );
+}
+
+#[test]
 fn distinguishes_transient_api_failures_from_authentication_failures() {
     let temp = TempDir::new().expect("temp directory");
     let fake_codex = compile_fake_codex(temp.path());
@@ -265,6 +297,12 @@ fn main() {
     io::stdin().read_to_string(&mut prompt).unwrap();
     fs::write(run_directory.join("args.txt"), format!("{}\n", args.join("\n"))).unwrap();
     fs::write(run_directory.join("prompt.txt"), &prompt).unwrap();
+    if args.iter().any(|arg| arg == "resume") {
+        let workspace_index = args.iter().position(|arg| arg == "-C").unwrap() + 1;
+        let workspace = PathBuf::from(&args[workspace_index]);
+        fs::write(workspace.join("resume-args.txt"), format!("{}\n", args.join("\n"))).unwrap();
+        fs::write(workspace.join("resume-prompt.txt"), &prompt).unwrap();
+    }
     if prompt.contains("TRANSIENT_API_FAILURE") {
         eprintln!("HTTP 503 service unavailable");
         std::process::exit(1);

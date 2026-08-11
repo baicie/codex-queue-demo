@@ -2,7 +2,7 @@
 
 Codex Queue 是一个面向 macOS 和 Windows 11 的 Tauri 桌面任务队列。桌面端使用 React、Vite 和 shadcn/ui，默认显示中文并支持英文、浅色和深色主题；Rust 内核负责校验队列、解析依赖、按顺序执行任务，以及在网络或 API 暂时不可用时进行指数退避重试。
 
-应用首页同时提供 **Task Supervisor** 工作台。Tauri 桌面端每 3 秒只读刷新 Codex Desktop 的本地 thread、Thread Goal、token 用量和 turn 时间线；浏览器开发模式继续使用本地演示快照。原有任务队列仍可从侧边栏进入。
+应用首页同时提供 **Task Supervisor** 工作台。Tauri 桌面端每 3 秒刷新 Codex Desktop 的本地 thread、Thread Goal、token 用量和 turn 时间线，并在有活动目标的任务异常停止或卡住时恢复同一任务；浏览器开发模式继续使用本地演示快照。原有任务队列仍可从侧边栏进入。
 
 这个项目提供两个入口，但共用同一份队列格式和 Rust 执行内核：
 
@@ -15,13 +15,14 @@ Supervisor 当前包含：
 
 - Tauri 模式读取 `~/.codex/state_*.sqlite`、`goals_*.sqlite` 与 session rollout JSONL，显示最近 50 个未归档主任务，并过滤内部 subagent thread。
 - 根据 `task_started`、`task_complete`、`turn_aborted` 和 `thread_goal_updated` 事件展示真实运行状态、错误、目标和时间线；rollout 使用增量缓存读取。
-- Tauri 模式保持只读，不会暂停、恢复、完成或启动真实模型 turn；任务选择仅保存在当前窗口内。
+- 仅对状态为 `active` 的目标自动恢复：turn 结束但目标未完成，或运行中的 rollout 超过 15 分钟没有进展且 Codex 已释放原生 thread writer lock 时，使用 `codex exec resume <thread-id>` 在原工作区继续同一任务。writer 仍存活时不会强制抢占，避免同一工作区出现两个 turn。
+- 恢复任务使用 `workspace-write` sandbox、`never` approval 和现有的 45 分钟进程上限；同一时刻最多恢复 4 个任务，恢复失败按 30 至 900 秒退避，每个 active goal 最多记录 6 次恢复 turn。
+- “恢复执行”可手动继续异常任务；“目标完成”会启动一次验证 turn，只有验证目标确实达成后才由 Codex 标记完成，而不是直接改写状态。
 - 浏览器模式保留 `running -> waiting -> resuming -> completed` 演示状态流、故障标记、健康检查、暂停、恢复、目标完成和数据重置操作。
-- 与 Codex App Server v2 schema 对齐的 `initialize`、`thread/resume`、`thread/goal/set` 和 recovery `turn/start` JSON-RPC 请求构造器。
 
-Supervisor 不启动长驻 `codex app-server`，因此不受单独安装的 Codex CLI 与 Codex Desktop 版本差异影响。它直接读取 Codex Desktop 已维护的本地状态，并且不会修改 SQLite、rollout 或目标记录。浏览器开发模式也不会意外启动 Codex 或执行工作区操作。
+Supervisor 不启动实验性的长驻 `codex app-server`。它只读查询 Codex Desktop 已维护的 SQLite 与 rollout；恢复和完成验证通过稳定的 Codex CLI resume 命令写入原 thread。浏览器开发模式不会意外启动 Codex 或执行工作区操作。
 
-Tauri UI 不承担后台定时唤醒。即使桌面窗口关闭，已安装的 macOS LaunchAgent 或 Windows Task Scheduler 任务仍会通过 CLI 执行队列。
+watchdog 随 Tauri 应用进程运行，关闭应用后停止。已安装的 macOS LaunchAgent 或 Windows Task Scheduler 仍只负责执行 JSON 队列；队列使用 `--ephemeral`，不会出现在 Supervisor 中。
 
 ## 功能
 

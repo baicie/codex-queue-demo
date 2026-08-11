@@ -49,8 +49,13 @@ export function SupervisorJobDetail({
   const { t, i18n } = useTranslation();
   const canResume =
     provider.state !== "offline" &&
-    ["waiting", "provider_down", "paused", "failed"].includes(job.status);
+    (readOnly
+      ? ["waiting", "provider_down", "failed"]
+      : ["waiting", "provider_down", "paused", "failed"]
+    ).includes(job.status);
   const isComplete = job.status === "completed";
+  const canComplete =
+    !isComplete && (!readOnly || !["running", "resuming"].includes(job.status));
 
   return (
     <section
@@ -76,48 +81,43 @@ export function SupervisorJobDetail({
             <span className="truncate">{job.workspace}</span>
           </p>
         </div>
-        {!readOnly && (
-          <div className="flex shrink-0 flex-wrap items-center gap-2">
-            {!isComplete && (
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    variant="outline"
-                    size="icon"
-                    aria-label={t("supervisor.actions.pause")}
-                    disabled={Boolean(busyAction) || job.status === "paused"}
-                    onClick={onPause}
-                  >
-                    <PauseIcon />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent>{t("supervisor.actions.pause")}</TooltipContent>
-              </Tooltip>
+        <div className="flex shrink-0 flex-wrap items-center gap-2">
+          {!readOnly && !isComplete && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="outline"
+                  size="icon"
+                  aria-label={t("supervisor.actions.pause")}
+                  disabled={Boolean(busyAction) || job.status === "paused"}
+                  onClick={onPause}
+                >
+                  <PauseIcon />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>{t("supervisor.actions.pause")}</TooltipContent>
+            </Tooltip>
+          )}
+          <Button
+            variant="outline"
+            disabled={Boolean(busyAction) || !canComplete}
+            onClick={onComplete}
+          >
+            <CheckIcon data-icon="inline-start" />
+            {t("supervisor.actions.completeGoal")}
+          </Button>
+          <Button
+            disabled={Boolean(busyAction) || !canResume}
+            onClick={onResume}
+          >
+            {busyAction === "resume" ? (
+              <RotateCwIcon className="animate-spin" data-icon="inline-start" />
+            ) : (
+              <PlayIcon data-icon="inline-start" />
             )}
-            <Button
-              variant="outline"
-              disabled={Boolean(busyAction) || isComplete}
-              onClick={onComplete}
-            >
-              <CheckIcon data-icon="inline-start" />
-              {t("supervisor.actions.completeGoal")}
-            </Button>
-            <Button
-              disabled={Boolean(busyAction) || !canResume}
-              onClick={onResume}
-            >
-              {busyAction === "resume" ? (
-                <RotateCwIcon
-                  className="animate-spin"
-                  data-icon="inline-start"
-                />
-              ) : (
-                <PlayIcon data-icon="inline-start" />
-              )}
-              {t("supervisor.actions.resume")}
-            </Button>
-          </div>
-        )}
+            {t("supervisor.actions.resume")}
+          </Button>
+        </div>
       </header>
 
       {job.status === "waiting" && (

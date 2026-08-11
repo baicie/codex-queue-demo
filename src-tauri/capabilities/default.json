@@ -9,6 +9,8 @@
     "dialog:allow-save",
     "allow-app-info",
     "allow-load-codex-supervisor",
+    "allow-resume-codex-thread",
+    "allow-complete-codex-goal",
     "allow-load-queue",
     "allow-save-queue",
     "allow-run-queue",

@@ -118,6 +118,7 @@ export const zhCN = {
         resumed: "已从原 Thread 启动恢复 Turn",
         paused: "任务已暂停",
         goalCompleted: "目标已标记完成",
+        completionCheckStarted: "已启动目标完成验证 Turn",
         actionFailed: "操作失败",
       },
       error: {

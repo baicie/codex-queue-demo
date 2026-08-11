@@ -72,7 +72,7 @@ describe("SupervisorDashboard", () => {
     expect(screen.getByRole("button", { name: "目标完成" })).toBeDisabled();
   });
 
-  it("refreshes live Codex tasks and hides demo mutation controls", async () => {
+  it("refreshes live Codex tasks, shows recovery actions, and hides demo controls", async () => {
     const live = createLiveSnapshot();
     const client = createReadOnlyClient(live);
     let intervalHandler: TimerHandler | undefined;
@@ -100,8 +100,11 @@ describe("SupervisorDashboard", () => {
         screen.queryByRole("button", { name: "暂停任务" }),
       ).not.toBeInTheDocument();
       expect(
-        screen.queryByRole("button", { name: "目标完成" }),
-      ).not.toBeInTheDocument();
+        screen.getByRole("button", { name: "恢复执行" }),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByRole("button", { name: "目标完成" }),
+      ).toBeInTheDocument();
       expect(interval).toHaveBeenCalledWith(expect.any(Function), 3_000);
 
       await act(async () => {

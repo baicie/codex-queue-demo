@@ -4,9 +4,11 @@ use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, UNIX_EPOCH};
 
 use chrono::{DateTime, SecondsFormat, Utc};
+use codex_queue_demo::{CodexCli, codex_thread_writer_available};
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use serde_json::Value;
@@ -17,10 +19,18 @@ const MAX_EVENTS: usize = 30;
 const MAX_OBJECTIVE_CHARS: usize = 1_000;
 const MAX_TITLE_CHARS: usize = 100;
 const MAX_ERROR_CHARS: usize = 500;
+const STALE_AFTER_SECONDS: i64 = 15 * 60;
+const MAX_RECOVERY_ATTEMPTS: u32 = 6;
+const MAX_CONCURRENT_RECOVERIES: usize = 4;
+const WATCH_INTERVAL: Duration = Duration::from_secs(3);
+const RECOVERY_MARKER: &str = "[codex-queue recovery]";
+const RECOVERY_PROMPT: &str = "[codex-queue recovery]\nContinue the existing active goal on this same thread. First inspect the current working tree, git diff, completed work, and test status. Do not repeat completed or irreversible actions. Continue from the first unfinished step. Before ending, verify the objective and mark the Thread Goal complete only when it is genuinely achieved; if blocked, record that status instead.";
+const COMPLETION_PROMPT: &str = "[codex-queue completion]\nVerify the existing Thread Goal against the current workspace and relevant checks. If it is genuinely achieved, mark the goal complete. If it is not achieved, continue the unfinished work instead of claiming completion.";
 
 #[derive(Clone, Default)]
 pub struct CodexSupervisorState {
     cache: Arc<Mutex<HashMap<PathBuf, CachedRollout>>>,
+    recoveries: Arc<Mutex<RecoveryGate>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -51,6 +61,8 @@ struct SupervisorJob {
     id: String,
     title: String,
     thread_id: String,
+    #[serde(skip)]
+    goal_created_at_ms: i64,
     workspace: String,
     original_goal: String,
     goal: SupervisorGoal,
@@ -68,6 +80,8 @@ struct SupervisorJob {
     finished_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_retry_at: Option<String>,
     events: Vec<SupervisorEvent>,
 }
 
@@ -105,13 +119,16 @@ struct GoalRecord {
     status: String,
     token_budget: Option<u64>,
     tokens_used: u64,
+    created_at_ms: i64,
     updated_at_ms: i64,
 }
 
 #[derive(Clone, Debug, Default)]
 struct RolloutScan {
     turn_count: u32,
-    provider_failure_count: u32,
+    recovery_turn_count: u32,
+    recovery_goal_created_at_ms: i64,
+    last_activity_at: i64,
     latest_user_message: Option<String>,
     lifecycle: Option<Lifecycle>,
     goal: Option<GoalRecord>,
@@ -146,12 +163,168 @@ enum Lifecycle {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryReason {
+    TurnEnded,
+    Stalled,
+}
+
+#[derive(Clone, Debug)]
+struct RecoveryFailure {
+    goal_created_at_ms: i64,
+    count: u32,
+    next_retry_at: i64,
+    error: String,
+}
+
+#[derive(Debug, Default)]
+struct RecoveryGate {
+    active: HashSet<String>,
+    failures: HashMap<String, RecoveryFailure>,
+}
+
+impl RecoveryGate {
+    fn try_start(
+        &mut self,
+        thread_id: &str,
+        goal_created_at_ms: i64,
+        now: i64,
+        force: bool,
+    ) -> bool {
+        if self.active.contains(thread_id) || self.active.len() >= MAX_CONCURRENT_RECOVERIES {
+            return false;
+        }
+        if self
+            .failures
+            .get(thread_id)
+            .is_some_and(|failure| failure.goal_created_at_ms != goal_created_at_ms)
+        {
+            self.failures.remove(thread_id);
+        }
+        if !force
+            && self.failures.get(thread_id).is_some_and(|failure| {
+                failure.count >= MAX_RECOVERY_ATTEMPTS || now < failure.next_retry_at
+            })
+        {
+            return false;
+        }
+        self.active.insert(thread_id.to_owned())
+    }
+
+    fn finish(&mut self, thread_id: &str, goal_created_at_ms: i64, error: Option<&str>, now: i64) {
+        self.active.remove(thread_id);
+        let Some(error) = error else {
+            self.failures.remove(thread_id);
+            return;
+        };
+        let failure = self
+            .failures
+            .entry(thread_id.to_owned())
+            .or_insert_with(|| RecoveryFailure {
+                goal_created_at_ms,
+                count: 0,
+                next_retry_at: now,
+                error: String::new(),
+            });
+        if failure.goal_created_at_ms != goal_created_at_ms {
+            *failure = RecoveryFailure {
+                goal_created_at_ms,
+                count: 0,
+                next_retry_at: now,
+                error: String::new(),
+            };
+        }
+        failure.count = failure.count.saturating_add(1);
+        failure.next_retry_at = now.saturating_add(retry_delay_seconds(failure.count));
+        failure.error = clamp_text(error, MAX_ERROR_CHARS);
+    }
+}
+
 #[tauri::command]
 pub async fn load_codex_supervisor(
     app: AppHandle,
     state: State<'_, CodexSupervisorState>,
 ) -> Result<SupervisorSnapshot, String> {
-    let codex_home = env::var_os("CODEX_HOME")
+    let codex_home = codex_home(&app)?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || load_with_recovery_state(&codex_home, &state))
+        .await
+        .map_err(|error| format!("Codex supervisor task failed: {error}"))?
+}
+
+#[tauri::command]
+pub async fn resume_codex_thread(
+    app: AppHandle,
+    state: State<'_, CodexSupervisorState>,
+    thread_id: String,
+) -> Result<bool, String> {
+    launch_for_thread(app, state.inner().clone(), thread_id, RECOVERY_PROMPT).await
+}
+
+#[tauri::command]
+pub async fn complete_codex_goal(
+    app: AppHandle,
+    state: State<'_, CodexSupervisorState>,
+    thread_id: String,
+) -> Result<bool, String> {
+    launch_for_thread(app, state.inner().clone(), thread_id, COMPLETION_PROMPT).await
+}
+
+pub fn start_watchdog(app: AppHandle, state: CodexSupervisorState) -> Result<(), String> {
+    let codex_home = codex_home(&app)?;
+    thread::Builder::new()
+        .name("codex-queue-watchdog".to_owned())
+        .spawn(move || {
+            loop {
+                // ponytail: four workers bound local resource use; add a pool only if this grows.
+                let _ = watch_once(&codex_home, &state);
+                thread::sleep(WATCH_INTERVAL);
+            }
+        })
+        .map(|_| ())
+        .map_err(|error| format!("Cannot start Codex watchdog: {error}"))
+}
+
+async fn launch_for_thread(
+    app: AppHandle,
+    state: CodexSupervisorState,
+    thread_id: String,
+    prompt: &'static str,
+) -> Result<bool, String> {
+    let codex_home = codex_home(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let snapshot = load_codex_supervisor_from_home(&codex_home, state.cache.as_ref())?;
+        let job = snapshot
+            .jobs
+            .iter()
+            .find(|job| job.thread_id == thread_id)
+            .ok_or_else(|| format!("Codex thread not found: {thread_id}"))?;
+        if job.goal.status == "complete" {
+            return Err("Codex thread goal is already complete".to_owned());
+        }
+        if job.goal.status != "active" {
+            return Err(format!(
+                "Codex thread goal is not active: {}",
+                job.goal.status
+            ));
+        }
+        if !codex_thread_writer_available(&codex_home, &job.thread_id)
+            .map_err(|error| format!("Cannot inspect Codex thread writer: {error:#}"))?
+        {
+            return Err("Codex thread still has an active writer".to_owned());
+        }
+        queue_recovery(&state, job, prompt, true).and_then(|started| {
+            started
+                .then_some(true)
+                .ok_or_else(|| "Codex recovery is already running or at capacity".to_owned())
+        })
+    })
+    .await
+    .map_err(|error| format!("Codex recovery task failed: {error}"))?
+}
+
+fn codex_home(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(env::var_os("CODEX_HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .unwrap_or(
@@ -159,13 +332,133 @@ pub async fn load_codex_supervisor(
                 .home_dir()
                 .map_err(|error| error.to_string())?
                 .join(".codex"),
-        );
-    let cache = Arc::clone(&state.cache);
-    tauri::async_runtime::spawn_blocking(move || {
-        load_codex_supervisor_from_home(&codex_home, cache.as_ref())
-    })
-    .await
-    .map_err(|error| format!("Codex supervisor task failed: {error}"))?
+        ))
+}
+
+fn load_with_recovery_state(
+    codex_home: &Path,
+    state: &CodexSupervisorState,
+) -> Result<SupervisorSnapshot, String> {
+    let mut snapshot = load_codex_supervisor_from_home(codex_home, state.cache.as_ref())?;
+    apply_recovery_state(&mut snapshot, state.recoveries.as_ref())?;
+    Ok(snapshot)
+}
+
+fn watch_once(codex_home: &Path, state: &CodexSupervisorState) -> Result<bool, String> {
+    let snapshot = load_codex_supervisor_from_home(codex_home, state.cache.as_ref())?;
+    let mut started = false;
+    for job in snapshot.jobs.iter().filter(|job| {
+        job.goal.status == "active"
+            && job.recovery_count < MAX_RECOVERY_ATTEMPTS
+            && matches!(job.status, "waiting" | "provider_down" | "failed")
+    }) {
+        if !codex_thread_writer_available(codex_home, &job.thread_id)
+            .map_err(|error| format!("Cannot inspect Codex thread writer: {error:#}"))?
+        {
+            continue;
+        }
+        started |= queue_recovery(state, job, RECOVERY_PROMPT, false)?;
+    }
+    Ok(started)
+}
+
+fn queue_recovery(
+    state: &CodexSupervisorState,
+    job: &SupervisorJob,
+    prompt: &'static str,
+    force: bool,
+) -> Result<bool, String> {
+    let now = Utc::now().timestamp();
+    if !state
+        .recoveries
+        .lock()
+        .map_err(|_| "Codex recovery lock is poisoned".to_owned())?
+        .try_start(&job.thread_id, job.goal_created_at_ms, now, force)
+    {
+        return Ok(false);
+    }
+
+    let thread_id = job.thread_id.clone();
+    let workspace = job.workspace.clone();
+    let goal_created_at_ms = job.goal_created_at_ms;
+    let worker_state = state.clone();
+    let worker_thread_id = thread_id.clone();
+    match thread::Builder::new()
+        .name("codex-queue-recovery".to_owned())
+        .spawn(move || {
+            let result = CodexCli::discover(None).and_then(|codex| {
+                codex.resume_thread(&worker_thread_id, Path::new(&workspace), prompt)
+            });
+            let error = result.as_ref().err().map(|error| format!("{error:#}"));
+            if let Err(lock_error) = finish_recovery(
+                &worker_state,
+                &worker_thread_id,
+                goal_created_at_ms,
+                error.as_deref(),
+            ) {
+                eprintln!("{lock_error}");
+            }
+        }) {
+        Ok(_) => Ok(true),
+        Err(error) => {
+            let error = format!("Cannot start Codex recovery worker: {error}");
+            finish_recovery(state, &thread_id, goal_created_at_ms, Some(&error))?;
+            Err(error)
+        }
+    }
+}
+
+fn finish_recovery(
+    state: &CodexSupervisorState,
+    thread_id: &str,
+    goal_created_at_ms: i64,
+    error: Option<&str>,
+) -> Result<(), String> {
+    state
+        .recoveries
+        .lock()
+        .map_err(|_| "Codex recovery lock is poisoned".to_owned())?
+        .finish(thread_id, goal_created_at_ms, error, Utc::now().timestamp());
+    Ok(())
+}
+
+fn apply_recovery_state(
+    snapshot: &mut SupervisorSnapshot,
+    recoveries: &Mutex<RecoveryGate>,
+) -> Result<(), String> {
+    let mut gate = recoveries
+        .lock()
+        .map_err(|_| "Codex recovery lock is poisoned".to_owned())?;
+    let active_goals = snapshot
+        .jobs
+        .iter()
+        .filter(|job| job.goal.status == "active")
+        .map(|job| (job.thread_id.clone(), job.goal_created_at_ms))
+        .collect::<HashMap<_, _>>();
+    gate.failures.retain(|thread_id, failure| {
+        active_goals.get(thread_id) == Some(&failure.goal_created_at_ms)
+    });
+
+    for job in &mut snapshot.jobs {
+        if job.goal.status == "complete" {
+            continue;
+        }
+        if gate.active.contains(&job.thread_id) {
+            job.status = "resuming";
+            job.next_retry_at = None;
+            job.last_error = None;
+        } else if let Some(failure) = gate.failures.get(&job.thread_id) {
+            job.recovery_count = job.recovery_count.max(failure.count);
+            job.next_retry_at = Some(iso_from_seconds(failure.next_retry_at));
+            job.last_error = Some(format!("Automatic recovery failed: {}", failure.error));
+        }
+    }
+    let degraded = snapshot
+        .jobs
+        .iter()
+        .any(|job| job.status == "provider_down" || job.status == "failed");
+    snapshot.provider.state = if degraded { "degraded" } else { "healthy" };
+    Ok(())
 }
 
 fn load_codex_supervisor_from_home(
@@ -191,7 +484,9 @@ fn load_codex_supervisor_from_home(
     for thread in threads {
         let scan = inspect_rollout(&thread.rollout_path, &mut cache).unwrap_or_default();
         let goal = goals.get(&thread.id);
-        jobs.push(build_job(thread, goal, scan));
+        let writer_available =
+            codex_thread_writer_available(codex_home, &thread.id).unwrap_or(false);
+        jobs.push(build_job(thread, goal, scan, writer_available));
     }
 
     cache.retain(|path, _| active_rollout_paths.contains(path));
@@ -264,7 +559,7 @@ fn load_goals(path: &Path) -> Result<HashMap<String, GoalRecord>, String> {
     let connection = open_read_only(path)?;
     let mut statement = connection
         .prepare(
-            "SELECT thread_id, objective, status, token_budget, tokens_used, updated_at_ms \
+            "SELECT thread_id, objective, status, token_budget, tokens_used, created_at_ms, updated_at_ms \
              FROM thread_goals",
         )
         .map_err(|error| format!("Cannot query {}: {error}", path.display()))?;
@@ -279,7 +574,8 @@ fn load_goals(path: &Path) -> Result<HashMap<String, GoalRecord>, String> {
                         .get::<_, Option<i64>>(3)?
                         .map(|value| value.max(0) as u64),
                     tokens_used: row.get::<_, i64>(4)?.max(0) as u64,
-                    updated_at_ms: row.get(5)?,
+                    created_at_ms: row.get(5)?,
+                    updated_at_ms: row.get(6)?,
                 },
             ))
         })
@@ -327,9 +623,9 @@ fn inspect_rollout(
     path: &Path,
     cache: &mut HashMap<PathBuf, CachedRollout>,
 ) -> Result<RolloutScan, String> {
-    let length = fs::metadata(path)
-        .map_err(|error| format!("Cannot inspect {}: {error}", path.display()))?
-        .len();
+    let metadata = fs::metadata(path)
+        .map_err(|error| format!("Cannot inspect {}: {error}", path.display()))?;
+    let length = metadata.len();
     if let Some(cached) = cache.get(path)
         && cached.length == length
     {
@@ -356,6 +652,12 @@ fn inspect_rollout(
     for line in complete.lines() {
         update_scan(&mut scan, line);
     }
+    scan.last_activity_at = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(scan.last_activity_at);
     cache.insert(
         path.to_path_buf(),
         CachedRollout {
@@ -398,9 +700,12 @@ fn update_scan(scan: &mut RolloutScan, line: &str) {
 
     match kind {
         "user_message" => {
-            scan.latest_user_message = payload["message"]
-                .as_str()
-                .map(|message| normalize_text(message, MAX_OBJECTIVE_CHARS));
+            if let Some(message) = payload["message"].as_str() {
+                if message.starts_with(RECOVERY_MARKER) {
+                    scan.recovery_turn_count = scan.recovery_turn_count.saturating_add(1);
+                }
+                scan.latest_user_message = Some(normalize_text(message, MAX_OBJECTIVE_CHARS));
+            }
         }
         "task_started" => {
             scan.turn_count = scan.turn_count.saturating_add(1);
@@ -430,9 +735,6 @@ fn update_scan(scan: &mut RolloutScan, line: &str) {
                 .as_str()
                 .map(|message| clamp_text(message, MAX_ERROR_CHARS));
             let provider_error = payload.get("error").is_some_and(is_provider_error);
-            if provider_error {
-                scan.provider_failure_count = scan.provider_failure_count.saturating_add(1);
-            }
             scan.lifecycle = Some(Lifecycle::Completed {
                 started_at,
                 completed_at,
@@ -484,6 +786,10 @@ fn update_scan(scan: &mut RolloutScan, line: &str) {
         }
         "thread_goal_updated" => {
             if let Some(goal) = parse_goal(&payload["goal"]) {
+                if scan.recovery_goal_created_at_ms != goal.created_at_ms {
+                    scan.recovery_turn_count = 0;
+                    scan.recovery_goal_created_at_ms = goal.created_at_ms;
+                }
                 scan.goal = Some(goal);
             }
         }
@@ -508,6 +814,7 @@ fn parse_goal(value: &Value) -> Option<GoalRecord> {
         status: value["status"].as_str()?.to_owned(),
         token_budget: value["tokenBudget"].as_u64(),
         tokens_used: value["tokensUsed"].as_u64().unwrap_or_default(),
+        created_at_ms: value["createdAt"].as_i64().unwrap_or_default() * 1_000,
         updated_at_ms: value["updatedAt"].as_i64().unwrap_or_default() * 1_000,
     })
 }
@@ -516,12 +823,29 @@ fn build_job(
     thread: ThreadRecord,
     stored_goal: Option<&GoalRecord>,
     scan: RolloutScan,
+    writer_available: bool,
 ) -> SupervisorJob {
     let current_goal = [stored_goal.cloned(), scan.goal.clone()]
         .into_iter()
         .flatten()
         .max_by_key(|goal| goal.updated_at_ms);
-    let status = job_status(current_goal.as_ref(), scan.lifecycle.as_ref());
+    let status = match recovery_reason(
+        current_goal.as_ref().map(|goal| goal.status.as_str()),
+        scan.lifecycle.as_ref(),
+        scan.last_activity_at,
+        Utc::now().timestamp(),
+        writer_available,
+        false,
+    ) {
+        Some(RecoveryReason::Stalled | RecoveryReason::TurnEnded) => {
+            match job_status(current_goal.as_ref(), scan.lifecycle.as_ref()) {
+                "provider_down" => "provider_down",
+                "failed" => "failed",
+                _ => "waiting",
+            }
+        }
+        None => job_status(current_goal.as_ref(), scan.lifecycle.as_ref()),
+    };
     let original_goal = scan
         .lifecycle
         .as_ref()
@@ -565,6 +889,10 @@ fn build_job(
         id: thread.id.clone(),
         title: normalize_text(&thread.title, MAX_TITLE_CHARS),
         thread_id: thread.id,
+        goal_created_at_ms: current_goal
+            .as_ref()
+            .map(|goal| goal.created_at_ms)
+            .unwrap_or_default(),
         workspace: thread.cwd,
         original_goal,
         goal: SupervisorGoal {
@@ -577,15 +905,16 @@ fn build_job(
         },
         status,
         attempts: scan.turn_count,
-        max_attempts: 0,
+        max_attempts: MAX_RECOVERY_ATTEMPTS,
         turn_count: scan.turn_count,
-        recovery_count: scan.provider_failure_count,
+        recovery_count: recovery_count_for_goal(current_goal.as_ref(), &scan),
         tokens_used,
         created_at: iso_from_seconds(thread.created_at),
         updated_at: iso_from_seconds(thread.updated_at),
         started_at,
         finished_at,
         last_error,
+        next_retry_at: None,
         events: scan.events.into_iter().collect(),
     }
 }
@@ -625,6 +954,9 @@ impl Lifecycle {
 }
 
 fn job_status(goal: Option<&GoalRecord>, lifecycle: Option<&Lifecycle>) -> &'static str {
+    if goal.is_some_and(|goal| goal.status == "complete") {
+        return "completed";
+    }
     match lifecycle {
         Some(Lifecycle::Running { .. }) => return "running",
         Some(Lifecycle::Completed {
@@ -637,12 +969,45 @@ fn job_status(goal: Option<&GoalRecord>, lifecycle: Option<&Lifecycle>) -> &'sta
         _ => {}
     }
     match goal.map(|goal| goal.status.as_str()) {
-        Some("complete") => "completed",
         Some("blocked") => "failed",
         Some("usage_limited" | "budget_limited") => "waiting",
         Some("paused") => "paused",
         _ => "paused",
     }
+}
+
+fn recovery_reason(
+    goal_status: Option<&str>,
+    lifecycle: Option<&Lifecycle>,
+    last_activity_at: i64,
+    now: i64,
+    writer_available: bool,
+    recovery_in_progress: bool,
+) -> Option<RecoveryReason> {
+    if recovery_in_progress || !writer_available || goal_status != Some("active") {
+        return None;
+    }
+    match lifecycle {
+        Some(Lifecycle::Running { .. })
+            if now.saturating_sub(last_activity_at) > STALE_AFTER_SECONDS =>
+        {
+            Some(RecoveryReason::Stalled)
+        }
+        Some(Lifecycle::Completed { .. } | Lifecycle::Aborted { .. }) => {
+            Some(RecoveryReason::TurnEnded)
+        }
+        _ => None,
+    }
+}
+
+fn recovery_count_for_goal(goal: Option<&GoalRecord>, scan: &RolloutScan) -> u32 {
+    goal.filter(|goal| goal.created_at_ms == scan.recovery_goal_created_at_ms)
+        .map(|_| scan.recovery_turn_count)
+        .unwrap_or_default()
+}
+
+fn retry_delay_seconds(attempt: u32) -> i64 {
+    (30_i64.saturating_mul(1_i64 << attempt.saturating_sub(1).min(5))).min(900)
 }
 
 fn goal_status_for_ui(status: &str) -> String {
@@ -800,6 +1165,7 @@ mod tests {
         let failed = load_codex_supervisor_from_home(directory.path(), &cache).unwrap();
         assert_eq!(failed.jobs[0].status, "provider_down");
         assert_eq!(failed.jobs[0].turn_count, 1);
+        assert_eq!(failed.jobs[0].recovery_count, 0);
         assert_eq!(
             failed.jobs[0].last_error.as_deref(),
             Some("503 Service Unavailable")
@@ -818,6 +1184,151 @@ mod tests {
         assert_eq!(completed.jobs[0].status, "completed");
         assert_eq!(completed.jobs[0].goal.status, "complete");
         assert_eq!(completed.jobs[0].turn_count, 2);
+    }
+
+    #[test]
+    fn completed_goal_wins_over_every_lifecycle_and_never_recovers() {
+        let goal = test_goal("complete");
+        let lifecycles = [
+            Lifecycle::Running {
+                turn_id: "running".to_owned(),
+                started_at: 0,
+                objective: None,
+            },
+            Lifecycle::Completed {
+                started_at: 0,
+                completed_at: 1,
+                error: Some("failed".to_owned()),
+                provider_error: false,
+                objective: None,
+            },
+            Lifecycle::Aborted {
+                started_at: 0,
+                completed_at: 1,
+                objective: None,
+            },
+        ];
+
+        for lifecycle in &lifecycles {
+            assert_eq!(job_status(Some(&goal), Some(lifecycle)), "completed");
+            assert_eq!(
+                recovery_reason(Some("complete"), Some(lifecycle), 0, 901, true, false),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn active_goal_recovers_after_any_ended_turn() {
+        let lifecycles = [
+            Lifecycle::Completed {
+                started_at: 0,
+                completed_at: 1,
+                error: Some("503 Service Unavailable".to_owned()),
+                provider_error: true,
+                objective: None,
+            },
+            Lifecycle::Aborted {
+                started_at: 0,
+                completed_at: 1,
+                objective: None,
+            },
+            Lifecycle::Completed {
+                started_at: 0,
+                completed_at: 1,
+                error: None,
+                provider_error: false,
+                objective: None,
+            },
+        ];
+
+        for lifecycle in &lifecycles {
+            assert_eq!(
+                recovery_reason(Some("active"), Some(lifecycle), 1, 1, true, false),
+                Some(RecoveryReason::TurnEnded)
+            );
+        }
+    }
+
+    #[test]
+    fn running_goal_recovers_only_after_fifteen_idle_minutes_without_a_live_writer() {
+        let lifecycle = Lifecycle::Running {
+            turn_id: "running".to_owned(),
+            started_at: 0,
+            objective: None,
+        };
+
+        assert_eq!(
+            recovery_reason(Some("active"), Some(&lifecycle), 0, 901, false, false),
+            None
+        );
+        assert_eq!(
+            recovery_reason(Some("active"), Some(&lifecycle), 0, 900, true, false),
+            None
+        );
+        assert_eq!(
+            recovery_reason(Some("active"), Some(&lifecycle), 0, 901, true, false),
+            Some(RecoveryReason::Stalled)
+        );
+        assert_eq!(
+            recovery_reason(Some("active"), Some(&lifecycle), 0, 901, true, true),
+            None
+        );
+    }
+
+    #[test]
+    fn recovery_attempts_belong_only_to_the_current_goal() {
+        let mut scan = RolloutScan {
+            recovery_turn_count: 6,
+            recovery_goal_created_at_ms: 1_000,
+            ..RolloutScan::default()
+        };
+        let mut goal = test_goal("active");
+        goal.created_at_ms = 2_000;
+
+        assert_eq!(recovery_count_for_goal(Some(&goal), &scan), 0);
+        goal.created_at_ms = 1_000;
+        assert_eq!(recovery_count_for_goal(Some(&goal), &scan), 6);
+
+        scan.recovery_turn_count = 0;
+        assert_eq!(recovery_count_for_goal(Some(&goal), &scan), 0);
+
+        scan.recovery_goal_created_at_ms = 2_000;
+        assert_eq!(recovery_count_for_goal(Some(&goal), &scan), 0);
+    }
+
+    #[test]
+    fn recovery_gate_deduplicates_and_backs_off_failures() {
+        let mut gate = RecoveryGate::default();
+
+        assert!(gate.try_start("thread-main", 1_000, 0, false));
+        assert!(!gate.try_start("thread-main", 1_000, 0, false));
+        gate.finish("thread-main", 1_000, Some("provider unavailable"), 0);
+        assert!(!gate.try_start("thread-main", 1_000, 29, false));
+        assert!(gate.try_start("thread-main", 1_000, 30, false));
+        gate.finish("thread-main", 1_000, None, 30);
+        assert!(gate.try_start("thread-main", 1_000, 30, false));
+    }
+
+    #[test]
+    fn recovery_gate_does_not_carry_failures_into_a_new_goal() {
+        let mut gate = RecoveryGate::default();
+
+        assert!(gate.try_start("thread-main", 1_000, 0, false));
+        gate.finish("thread-main", 1_000, Some("provider unavailable"), 0);
+        assert!(!gate.try_start("thread-main", 1_000, 1, false));
+        assert!(gate.try_start("thread-main", 2_000, 1, false));
+    }
+
+    #[test]
+    fn recovery_gate_caps_parallel_workers() {
+        let mut gate = RecoveryGate::default();
+        for index in 0..4 {
+            assert!(gate.try_start(&format!("thread-{index}"), 1_000, 0, false));
+        }
+        assert!(!gate.try_start("thread-4", 1_000, 0, false));
+        gate.finish("thread-0", 1_000, None, 0);
+        assert!(gate.try_start("thread-4", 1_000, 0, false));
     }
 
     struct TestThread<'a> {
@@ -877,13 +1388,14 @@ mod tests {
             .execute_batch(
                 "CREATE TABLE thread_goals (\
                     thread_id TEXT PRIMARY KEY, objective TEXT NOT NULL, status TEXT NOT NULL, \
-                    token_budget INTEGER, tokens_used INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL\
+                    token_budget INTEGER, tokens_used INTEGER NOT NULL, created_at_ms INTEGER NOT NULL, \
+                    updated_at_ms INTEGER NOT NULL\
                 );",
             )
             .unwrap();
         connection
             .execute(
-                "INSERT INTO thread_goals VALUES (?1, ?2, ?3, NULL, 1200, ?4)",
+                "INSERT INTO thread_goals VALUES (?1, ?2, ?3, NULL, 1200, ?4, ?4)",
                 params![thread_id, objective, status, updated_at_ms],
             )
             .unwrap();
@@ -909,5 +1421,16 @@ mod tests {
     fn append_event(path: &Path, event: Value) {
         let mut file = OpenOptions::new().append(true).open(path).unwrap();
         writeln!(file, "{event}").unwrap();
+    }
+
+    fn test_goal(status: &str) -> GoalRecord {
+        GoalRecord {
+            objective: "Finish the task".to_owned(),
+            status: status.to_owned(),
+            token_budget: None,
+            tokens_used: 0,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        }
     }
 }
