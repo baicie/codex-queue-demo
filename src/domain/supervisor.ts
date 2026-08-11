@@ -21,6 +21,9 @@ export type ProviderState = "healthy" | "degraded" | "offline";
 export type SupervisorEventKind =
   | "job_created"
   | "turn_started"
+  | "turn_completed"
+  | "turn_failed"
+  | "turn_interrupted"
   | "provider_down"
   | "retry_scheduled"
   | "provider_restored"
@@ -63,6 +66,7 @@ export interface SupervisorJob {
   maxAttempts: number;
   turnCount: number;
   recoveryCount: number;
+  tokensUsed: number;
   createdAt: string;
   updatedAt: string;
   startedAt?: string;
@@ -74,7 +78,9 @@ export interface SupervisorJob {
 
 export interface SupervisorSnapshot {
   version: 1;
-  selectedJobId: string;
+  source: "demo" | "codex";
+  readOnly: boolean;
+  selectedJobId: string | null;
   provider: ProviderHealth;
   jobs: SupervisorJob[];
 }
@@ -207,6 +213,8 @@ export function createDemoSupervisor(now = new Date()): SupervisorSnapshot {
 
   return {
     version: 1,
+    source: "demo",
+    readOnly: false,
     selectedJobId: releaseJob.id,
     provider: {
       name: "Atlas Relay",
@@ -410,10 +418,15 @@ export function summarizeSupervisor(
 
 function createJob({
   goalStatus = "active",
+  tokensUsed = 0,
   ...input
-}: Omit<SupervisorJob, "goal"> & { goalStatus?: GoalStatus }): SupervisorJob {
+}: Omit<SupervisorJob, "goal" | "tokensUsed"> & {
+  goalStatus?: GoalStatus;
+  tokensUsed?: number;
+}): SupervisorJob {
   return {
     ...input,
+    tokensUsed,
     goal: {
       objective: input.originalGoal,
       status: goalStatus,

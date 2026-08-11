@@ -1,3 +1,5 @@
+import { invoke, isTauri } from "@tauri-apps/api/core";
+
 import {
   SUPERVISOR_STATUSES,
   completeSupervisorGoal,
@@ -28,16 +30,32 @@ const STORAGE_KEY = "codex-queue.supervisor:v1";
 const LOCK_NAME = "codex-queue.supervisor-lock";
 let fallbackLock: Promise<void> = Promise.resolve();
 
-class LocalSupervisorClient implements SupervisorClient {
+class HybridSupervisorClient implements SupervisorClient {
+  private liveSnapshot?: SupervisorSnapshot;
+
   async load(): Promise<SupervisorSnapshot> {
+    if (isTauri()) return this.loadLiveSnapshot();
+
+    this.liveSnapshot = undefined;
     return clone(loadSnapshot());
   }
 
   async save(snapshot: SupervisorSnapshot): Promise<SupervisorSnapshot> {
+    rejectLiveMutation();
     return withSupervisorLock(() => persistSnapshot(snapshot));
   }
 
   async selectJob(jobId: string): Promise<SupervisorSnapshot> {
+    if (isTauri()) {
+      const snapshot = this.liveSnapshot ?? (await this.loadLiveSnapshot());
+      if (!snapshot.jobs.some((job) => job.id === jobId)) {
+        throw new Error(`supervisor job not found: ${jobId}`);
+      }
+      const selected = { ...snapshot, selectedJobId: jobId };
+      this.liveSnapshot = selected;
+      return clone(selected);
+    }
+
     return this.mutate((snapshot) => {
       if (!snapshot.jobs.some((job) => job.id === jobId)) {
         throw new Error(`supervisor job not found: ${jobId}`);
@@ -50,10 +68,12 @@ class LocalSupervisorClient implements SupervisorClient {
     jobId: string,
     now = new Date(),
   ): Promise<SupervisorSnapshot> {
+    rejectLiveMutation();
     return this.mutate((snapshot) => markProviderDown(snapshot, jobId, now));
   }
 
   async markProviderHealthy(now = new Date()): Promise<SupervisorSnapshot> {
+    rejectLiveMutation();
     return this.mutate((snapshot) => markProviderHealthy(snapshot, now));
   }
 
@@ -61,10 +81,12 @@ class LocalSupervisorClient implements SupervisorClient {
     jobId: string,
     now = new Date(),
   ): Promise<SupervisorSnapshot> {
+    rejectLiveMutation();
     return this.mutate((snapshot) => resumeSupervisorJob(snapshot, jobId, now));
   }
 
   async pauseJob(jobId: string, now = new Date()): Promise<SupervisorSnapshot> {
+    rejectLiveMutation();
     return this.mutate((snapshot) => pauseSupervisorJob(snapshot, jobId, now));
   }
 
@@ -72,13 +94,36 @@ class LocalSupervisorClient implements SupervisorClient {
     jobId: string,
     now = new Date(),
   ): Promise<SupervisorSnapshot> {
+    rejectLiveMutation();
     return this.mutate((snapshot) =>
       completeSupervisorGoal(snapshot, jobId, now),
     );
   }
 
   async resetDemo(now = new Date()): Promise<SupervisorSnapshot> {
+    rejectLiveMutation();
     return withSupervisorLock(() => persistSnapshot(createDemoSupervisor(now)));
+  }
+
+  private async loadLiveSnapshot(): Promise<SupervisorSnapshot> {
+    const value = await invoke<unknown>("load_codex_supervisor");
+    if (
+      !isSupervisorSnapshot(value) ||
+      value.source !== "codex" ||
+      !value.readOnly
+    ) {
+      throw new Error("the Codex supervisor snapshot is invalid");
+    }
+
+    const selectedJobId = this.liveSnapshot?.selectedJobId;
+    const snapshot =
+      selectedJobId !== null &&
+      selectedJobId !== undefined &&
+      value.jobs.some((job) => job.id === selectedJobId)
+        ? { ...value, selectedJobId }
+        : value;
+    this.liveSnapshot = clone(snapshot);
+    return clone(snapshot);
   }
 
   private async mutate(
@@ -90,7 +135,7 @@ class LocalSupervisorClient implements SupervisorClient {
   }
 }
 
-export const supervisorClient: SupervisorClient = new LocalSupervisorClient();
+export const supervisorClient: SupervisorClient = new HybridSupervisorClient();
 
 function loadSnapshot(): SupervisorSnapshot {
   const input = browserStorage().getItem(STORAGE_KEY);
@@ -104,7 +149,7 @@ function loadSnapshot(): SupervisorSnapshot {
       cause: error,
     });
   }
-  const migrated = migrateLegacyGoalStatus(value);
+  const migrated = migrateLegacySnapshot(value);
   if (!isSupervisorSnapshot(migrated.value)) {
     throw new Error("the local supervisor snapshot is invalid");
   }
@@ -145,16 +190,18 @@ function isSupervisorSnapshot(value: unknown): value is SupervisorSnapshot {
   return (
     isRecord(value) &&
     value.version === 1 &&
-    typeof value.selectedJobId === "string" &&
+    (value.source === "demo" || value.source === "codex") &&
+    typeof value.readOnly === "boolean" &&
     isProviderHealth(value.provider) &&
     Array.isArray(value.jobs) &&
-    value.jobs.length > 0 &&
     value.jobs.every(isSupervisorJob) &&
-    value.jobs.some((job) => job.id === value.selectedJobId)
+    ((value.selectedJobId === null && value.jobs.length === 0) ||
+      (typeof value.selectedJobId === "string" &&
+        value.jobs.some((job) => job.id === value.selectedJobId)))
   );
 }
 
-function migrateLegacyGoalStatus(value: unknown): {
+function migrateLegacySnapshot(value: unknown): {
   value: unknown;
   changed: boolean;
 } {
@@ -162,19 +209,35 @@ function migrateLegacyGoalStatus(value: unknown): {
     return { value, changed: false };
   }
 
-  let changed = false;
+  let changed = value.source === undefined || value.readOnly === undefined;
   const jobs = value.jobs.map((job) => {
-    if (
-      !isRecord(job) ||
-      !isRecord(job.goal) ||
-      job.goal.status !== "completed"
-    ) {
-      return job;
+    if (!isRecord(job)) return job;
+
+    let migratedJob = job;
+    if (job.tokensUsed === undefined) {
+      changed = true;
+      migratedJob = { ...migratedJob, tokensUsed: 0 };
     }
-    changed = true;
-    return { ...job, goal: { ...job.goal, status: "complete" } };
+    if (isRecord(job.goal) && job.goal.status === "completed") {
+      changed = true;
+      migratedJob = {
+        ...migratedJob,
+        goal: { ...job.goal, status: "complete" },
+      };
+    }
+    return migratedJob;
   });
-  return changed ? { value: { ...value, jobs }, changed } : { value, changed };
+  return changed
+    ? {
+        value: {
+          ...value,
+          source: value.source ?? "demo",
+          readOnly: value.readOnly ?? false,
+          jobs,
+        },
+        changed,
+      }
+    : { value, changed };
 }
 
 function isProviderHealth(value: unknown): boolean {
@@ -214,6 +277,7 @@ function isSupervisorJob(value: unknown): value is SupervisorJob {
     isNonNegativeInteger(value.maxAttempts) &&
     isNonNegativeInteger(value.turnCount) &&
     isNonNegativeInteger(value.recoveryCount) &&
+    isNonNegativeInteger(value.tokensUsed) &&
     isDateTime(value.createdAt) &&
     isDateTime(value.updatedAt) &&
     isOptionalDateTime(value.startedAt) &&
@@ -254,6 +318,12 @@ function isNonNegativeInteger(value: unknown): value is number {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function rejectLiveMutation(): void {
+  if (isTauri()) {
+    throw new Error("the live Codex supervisor is read-only");
+  }
 }
 
 function browserStorage(): Storage {

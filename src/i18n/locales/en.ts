@@ -47,6 +47,7 @@ export const en = {
         visible: "{{count}} shown",
         filterLabel: "Filter jobs",
         turn: "Turn {{value}}",
+        noMatches: "No tasks match this filter",
         filter: {
           all: "All",
           active: "Active",
@@ -84,7 +85,12 @@ export const en = {
         turns: "Turns",
         attempts: "Attempts",
         budget: "Token budget",
+        tokens: "Token usage",
         updated: "Last updated",
+      },
+      empty: {
+        title: "No Codex tasks",
+        description: "Codex Desktop has no visible main tasks right now.",
       },
       timeline: {
         title: "Recovery timeline",
@@ -106,6 +112,7 @@ export const en = {
       },
       toast: {
         providerHealthy: "Provider health check passed",
+        refreshed: "Task status refreshed",
         providerDown: "Job is awaiting recovery",
         demoReset: "Demo data reset",
         resumed: "Recovery turn started on the existing thread",

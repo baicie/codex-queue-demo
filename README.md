@@ -2,7 +2,7 @@
 
 Codex Queue 是一个面向 macOS 和 Windows 11 的 Tauri 桌面任务队列。桌面端使用 React、Vite 和 shadcn/ui，默认显示中文并支持英文、浅色和深色主题；Rust 内核负责校验队列、解析依赖、按顺序执行任务，以及在网络或 API 暂时不可用时进行指数退避重试。
 
-应用首页同时提供 **Task Supervisor** 工作台，用于观察持久化的 job、thread、Thread Goal、Provider 健康状态和恢复时间线。Supervisor 的浏览器与 Tauri WebView MVP 使用本地 snapshot 适配器，可以完整演示 Provider 故障、指数退避、健康恢复、复用原 thread 创建 recovery turn，以及目标完成状态；原有任务队列仍可从侧边栏进入。
+应用首页同时提供 **Task Supervisor** 工作台。Tauri 桌面端每 3 秒只读刷新 Codex Desktop 的本地 thread、Thread Goal、token 用量和 turn 时间线；浏览器开发模式继续使用本地演示快照。原有任务队列仍可从侧边栏进入。
 
 这个项目提供两个入口，但共用同一份队列格式和 Rust 执行内核：
 
@@ -13,13 +13,13 @@ Codex Queue 是一个面向 macOS 和 Windows 11 的 Tauri 桌面任务队列。
 
 Supervisor 当前包含：
 
-- 持久化 `jobId + threadId + workspace + originalGoal + status`。
-- `running -> waiting -> resuming -> completed` 的恢复状态流和有上限的指数退避。
-- Provider 健康状态、恢复时间线、Thread Goal 与 token budget 展示。
-- 故障标记、健康检查、暂停、恢复执行、目标完成和演示数据重置操作。
+- Tauri 模式读取 `~/.codex/state_*.sqlite`、`goals_*.sqlite` 与 session rollout JSONL，显示最近 50 个未归档主任务，并过滤内部 subagent thread。
+- 根据 `task_started`、`task_complete`、`turn_aborted` 和 `thread_goal_updated` 事件展示真实运行状态、错误、目标和时间线；rollout 使用增量缓存读取。
+- Tauri 模式保持只读，不会暂停、恢复、完成或启动真实模型 turn；任务选择仅保存在当前窗口内。
+- 浏览器模式保留 `running -> waiting -> resuming -> completed` 演示状态流、故障标记、健康检查、暂停、恢复、目标完成和数据重置操作。
 - 与 Codex App Server v2 schema 对齐的 `initialize`、`thread/resume`、`thread/goal/set` 和 recovery `turn/start` JSON-RPC 请求构造器。
 
-当前 `SupervisorClient` 是本地持久化适配器，不会启动真实模型 turn。生产连接需要在 Tauri 端增加长驻 `codex app-server` 进程、JSONL 读写、审批请求处理和事件订阅，再使用 `src/lib/supervisor/app-server-protocol.ts` 中的请求构造器替换本地动作。这个边界是有意保留的：现有 MVP 可以独立验证状态机和 UI，同时不会在浏览器开发模式中意外启动 Codex 或执行工作区操作。
+Supervisor 不启动长驻 `codex app-server`，因此不受单独安装的 Codex CLI 与 Codex Desktop 版本差异影响。它直接读取 Codex Desktop 已维护的本地状态，并且不会修改 SQLite、rollout 或目标记录。浏览器开发模式也不会意外启动 Codex 或执行工作区操作。
 
 Tauri UI 不承担后台定时唤醒。即使桌面窗口关闭，已安装的 macOS LaunchAgent 或 Windows Task Scheduler 任务仍会通过 CLI 执行队列。
 
@@ -265,14 +265,14 @@ open -b com.openai.codex
 推送与应用版本一致的 `v*` tag 会触发 `.github/workflows/release.yml`：
 
 ```bash
-git tag v0.3.0-dev.0
-git push origin v0.3.0-dev.0
+git tag v0.3.0-dev.1
+git push origin v0.3.0-dev.1
 ```
 
 如果 tag 已受仓库规则保护而需要重新发布，可从 `main` 手动运行 workflow，并将 `tag` 输入设为目标 tag：
 
 ```bash
-gh workflow run release.yml --ref main -f tag=v0.3.0-dev.0
+gh workflow run release.yml --ref main -f tag=v0.3.0-dev.1
 ```
 
 Release workflow 只接受位于 `main` 历史上的 tag，并在任何发布构建开始前重新执行完整的前端、Rust 和调度脚本质量门。质量门通过后会生成：

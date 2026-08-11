@@ -18,7 +18,7 @@ describe("Codex app-server protocol requests", () => {
       id: 1,
       method: "initialize",
       params: {
-        clientInfo: { name: "codex-queue-supervisor", version: "0.3.0-dev.0" },
+        clientInfo: { name: "codex-queue-supervisor", version: "0.3.0-dev.1" },
         capabilities: { experimentalApi: true },
       },
     });

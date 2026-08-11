@@ -32,6 +32,7 @@ import {
 export function SupervisorJobDetail({
   job,
   provider,
+  readOnly,
   busyAction,
   onResume,
   onPause,
@@ -39,6 +40,7 @@ export function SupervisorJobDetail({
 }: {
   job: SupervisorJob;
   provider: ProviderHealth;
+  readOnly: boolean;
   busyAction?: string;
   onResume: () => void;
   onPause: () => void;
@@ -74,43 +76,48 @@ export function SupervisorJobDetail({
             <span className="truncate">{job.workspace}</span>
           </p>
         </div>
-        <div className="flex shrink-0 flex-wrap items-center gap-2">
-          {!isComplete && (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  variant="outline"
-                  size="icon"
-                  aria-label={t("supervisor.actions.pause")}
-                  disabled={Boolean(busyAction) || job.status === "paused"}
-                  onClick={onPause}
-                >
-                  <PauseIcon />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>{t("supervisor.actions.pause")}</TooltipContent>
-            </Tooltip>
-          )}
-          <Button
-            variant="outline"
-            disabled={Boolean(busyAction) || isComplete}
-            onClick={onComplete}
-          >
-            <CheckIcon data-icon="inline-start" />
-            {t("supervisor.actions.completeGoal")}
-          </Button>
-          <Button
-            disabled={Boolean(busyAction) || !canResume}
-            onClick={onResume}
-          >
-            {busyAction === "resume" ? (
-              <RotateCwIcon className="animate-spin" data-icon="inline-start" />
-            ) : (
-              <PlayIcon data-icon="inline-start" />
+        {!readOnly && (
+          <div className="flex shrink-0 flex-wrap items-center gap-2">
+            {!isComplete && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    aria-label={t("supervisor.actions.pause")}
+                    disabled={Boolean(busyAction) || job.status === "paused"}
+                    onClick={onPause}
+                  >
+                    <PauseIcon />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>{t("supervisor.actions.pause")}</TooltipContent>
+              </Tooltip>
             )}
-            {t("supervisor.actions.resume")}
-          </Button>
-        </div>
+            <Button
+              variant="outline"
+              disabled={Boolean(busyAction) || isComplete}
+              onClick={onComplete}
+            >
+              <CheckIcon data-icon="inline-start" />
+              {t("supervisor.actions.completeGoal")}
+            </Button>
+            <Button
+              disabled={Boolean(busyAction) || !canResume}
+              onClick={onResume}
+            >
+              {busyAction === "resume" ? (
+                <RotateCwIcon
+                  className="animate-spin"
+                  data-icon="inline-start"
+                />
+              ) : (
+                <PlayIcon data-icon="inline-start" />
+              )}
+              {t("supervisor.actions.resume")}
+            </Button>
+          </div>
+        )}
       </header>
 
       {job.status === "waiting" && (
@@ -146,13 +153,11 @@ export function SupervisorJobDetail({
               />
               <Metric
                 label={t("supervisor.detail.attempts")}
-                value={`${job.attempts} / ${job.maxAttempts}`}
+                value={formatAttempts(job)}
               />
               <Metric
-                label={t("supervisor.detail.budget")}
-                value={new Intl.NumberFormat(i18n.language).format(
-                  job.goal.tokenBudget,
-                )}
+                label={t("supervisor.detail.tokens")}
+                value={formatTokenUsage(job, i18n.language)}
               />
               <Metric
                 label={t("supervisor.detail.updated")}
@@ -357,12 +362,35 @@ function ContextItem({
 }
 
 function eventTone(kind: SupervisorEvent["kind"]): string {
-  if (kind === "goal_completed" || kind === "provider_restored")
+  if (
+    kind === "goal_completed" ||
+    kind === "provider_restored" ||
+    kind === "turn_completed"
+  )
     return "text-success";
-  if (kind === "provider_down" || kind === "retry_scheduled")
+  if (
+    kind === "provider_down" ||
+    kind === "retry_scheduled" ||
+    kind === "turn_failed"
+  )
     return "text-warning-text";
-  if (kind === "job_paused") return "text-muted-foreground";
+  if (kind === "job_paused" || kind === "turn_interrupted")
+    return "text-muted-foreground";
   return "text-info";
+}
+
+function formatTokenUsage(job: SupervisorJob, locale: string): string {
+  const formatter = new Intl.NumberFormat(locale);
+  const used = formatter.format(job.tokensUsed);
+  return job.goal.tokenBudget > 0
+    ? `${used} / ${formatter.format(job.goal.tokenBudget)}`
+    : used;
+}
+
+function formatAttempts(job: SupervisorJob): string {
+  return job.maxAttempts > 0
+    ? `${job.attempts} / ${job.maxAttempts}`
+    : String(job.attempts);
 }
 
 function formatTime(value: string, locale: string): string {
