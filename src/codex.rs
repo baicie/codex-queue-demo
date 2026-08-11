@@ -1,6 +1,6 @@
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -8,6 +8,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use fs2::FileExt;
 #[cfg(windows)]
 use process_wrap::std::CommandWrapper;
 #[cfg(windows)]
@@ -15,6 +16,7 @@ use process_wrap::std::JobObject;
 #[cfg(unix)]
 use process_wrap::std::ProcessGroup;
 use process_wrap::std::{ChildWrapper, CommandWrap};
+use tempfile::tempdir;
 
 use crate::{QueueRunner, Task, TransientTaskError};
 
@@ -56,6 +58,61 @@ impl CodexCli {
         )?;
         Ok(Self::new(binary))
     }
+
+    pub fn resume_thread(&self, thread_id: &str, workspace: &Path, prompt: &str) -> Result<()> {
+        if thread_id.trim().is_empty() || prompt.trim().is_empty() {
+            bail!("thread ID and recovery prompt must not be empty");
+        }
+        let output = tempdir().context("failed to create recovery output directory")?;
+        resume_thread_with_spawn(
+            &self.binary,
+            self.execution_timeout,
+            thread_id,
+            workspace,
+            prompt,
+            output.path(),
+            spawn_command_group,
+        )
+    }
+}
+
+pub fn codex_thread_writer_available(codex_home: &Path, thread_id: &str) -> Result<bool> {
+    if thread_id.trim().is_empty() {
+        bail!("thread ID must not be empty");
+    }
+    let lock_path = codex_home
+        .join("thread-writer-locks")
+        .join(format!("{thread_id}.lock"));
+    let file = match OpenOptions::new().read(true).write(true).open(&lock_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(error) if thread_writer_lock_contended(&error) => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect {}", lock_path.display()));
+        }
+    };
+    match FileExt::try_lock_exclusive(&file) {
+        Ok(()) => {
+            FileExt::unlock(&file)
+                .with_context(|| format!("failed to unlock {}", lock_path.display()))?;
+            Ok(true)
+        }
+        Err(error) if thread_writer_lock_contended(&error) => Ok(false),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to inspect {}", lock_path.display()))
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn thread_writer_lock_contended(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::WouldBlock
+}
+
+#[cfg(windows)]
+fn thread_writer_lock_contended(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::WouldBlock || matches!(error.raw_os_error(), Some(32 | 33))
 }
 
 impl Default for CodexCli {
@@ -291,7 +348,70 @@ fn execute_task_with_spawn(
         .stdin(Stdio::piped())
         .stdout(Stdio::from(events_file))
         .stderr(Stdio::from(stderr_file));
-    let child = spawn(command).with_context(|| format!("failed to start {binary:?}"))?;
+    run_prompt_command_with_spawn(
+        command,
+        &task.prompt,
+        execution_timeout,
+        &events_output,
+        &stderr_output,
+        spawn,
+    )
+}
+
+fn resume_thread_with_spawn(
+    binary: &OsString,
+    execution_timeout: Duration,
+    thread_id: &str,
+    workspace: &Path,
+    prompt: &str,
+    run_directory: &Path,
+    spawn: impl FnOnce(Command) -> io::Result<Box<dyn ChildWrapper>>,
+) -> Result<()> {
+    let final_output = run_directory.join("final.txt");
+    let events_output = run_directory.join("events.jsonl");
+    let stderr_output = run_directory.join("stderr.log");
+    let events_file = File::create(&events_output)
+        .with_context(|| format!("failed to create {}", events_output.display()))?;
+    let stderr_file = File::create(&stderr_output)
+        .with_context(|| format!("failed to create {}", stderr_output.display()))?;
+    let mut command = Command::new(binary);
+    command
+        .arg("-a")
+        .arg("never")
+        .arg("--sandbox")
+        .arg("workspace-write")
+        .arg("-C")
+        .arg(workspace)
+        .arg("exec")
+        .arg("--json")
+        .arg("--skip-git-repo-check")
+        .arg("-o")
+        .arg(&final_output)
+        .arg("resume")
+        .arg(thread_id)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::from(events_file))
+        .stderr(Stdio::from(stderr_file));
+    run_prompt_command_with_spawn(
+        command,
+        prompt,
+        execution_timeout,
+        &events_output,
+        &stderr_output,
+        spawn,
+    )
+}
+
+fn run_prompt_command_with_spawn(
+    command: Command,
+    prompt: &str,
+    execution_timeout: Duration,
+    events_output: &Path,
+    stderr_output: &Path,
+    spawn: impl FnOnce(Command) -> io::Result<Box<dyn ChildWrapper>>,
+) -> Result<()> {
+    let child = spawn(command).context("failed to start Codex")?;
     let mut child = SpawnedChildGuard::new(child);
 
     let mut stdin = child
@@ -299,7 +419,7 @@ fn execute_task_with_spawn(
         .stdin()
         .take()
         .context("Codex stdin is unavailable")?;
-    let prompt = task.prompt.clone();
+    let prompt = prompt.to_owned();
     let stdin_writer = thread::spawn(move || -> Result<()> {
         stdin
             .write_all(prompt.as_bytes())
@@ -324,8 +444,8 @@ fn execute_task_with_spawn(
         .context("failed to clean up the Codex process tree")?;
     let stdin_result = join_stdin_writer(stdin_writer);
 
-    let stdout = fs::read(&events_output).context("failed to read Codex event log")?;
-    let stderr = fs::read(&stderr_output).context("failed to read Codex stderr log")?;
+    let stdout = fs::read(events_output).context("failed to read Codex event log")?;
+    let stderr = fs::read(stderr_output).context("failed to read Codex stderr log")?;
 
     if !status.success() {
         let stderr_text = String::from_utf8_lossy(&stderr);
@@ -684,13 +804,35 @@ mod tests {
 #[cfg(test)]
 mod binary_resolution_tests {
     use std::env;
-    use std::fs;
+    use std::fs::{self, OpenOptions};
     use std::thread;
     use std::time::Duration;
 
+    use fs2::FileExt;
     use tempfile::TempDir;
 
-    use super::{probe_codex_binary, select_codex_binary};
+    use super::{codex_thread_writer_available, probe_codex_binary, select_codex_binary};
+
+    #[test]
+    fn only_resumes_when_codex_releases_the_thread_writer() {
+        let temp = TempDir::new().expect("temp directory");
+        let locks = temp.path().join("thread-writer-locks");
+        fs::create_dir(&locks).unwrap();
+        let lock_path = locks.join("thread-main.lock");
+        let owner = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        owner.lock_exclusive().unwrap();
+
+        assert!(!codex_thread_writer_available(temp.path(), "thread-main").unwrap());
+        FileExt::unlock(&owner).unwrap();
+        assert!(codex_thread_writer_available(temp.path(), "thread-main").unwrap());
+        assert!(codex_thread_writer_available(temp.path(), "missing-thread").unwrap());
+    }
 
     #[test]
     fn finds_an_installed_cli_when_the_gui_path_has_no_codex() {

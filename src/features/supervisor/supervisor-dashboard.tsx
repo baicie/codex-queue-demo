@@ -329,7 +329,9 @@ export function SupervisorDashboard({
                   void perform(
                     "complete",
                     () => client.completeGoal(selectedJob.id),
-                    "supervisor.toast.goalCompleted",
+                    snapshot.readOnly
+                      ? "supervisor.toast.completionCheckStarted"
+                      : "supervisor.toast.goalCompleted",
                   )
                 }
               />

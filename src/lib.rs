@@ -8,7 +8,7 @@ use thiserror::Error;
 mod codex;
 mod worker;
 
-pub use codex::CodexCli;
+pub use codex::{CodexCli, codex_thread_writer_available};
 pub use worker::{
     QueueFileSnapshot, QueueRunner, RunSummary, TransientTaskError, WorkerError, WorkerOptions,
     create_queue_file_if_missing, load_queue_file, load_queue_file_with_revision, run_queue_file,

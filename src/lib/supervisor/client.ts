@@ -81,7 +81,10 @@ class HybridSupervisorClient implements SupervisorClient {
     jobId: string,
     now = new Date(),
   ): Promise<SupervisorSnapshot> {
-    rejectLiveMutation();
+    if (isTauri()) {
+      await invoke("resume_codex_thread", { threadId: jobId });
+      return this.loadLiveSnapshot();
+    }
     return this.mutate((snapshot) => resumeSupervisorJob(snapshot, jobId, now));
   }
 
@@ -94,7 +97,10 @@ class HybridSupervisorClient implements SupervisorClient {
     jobId: string,
     now = new Date(),
   ): Promise<SupervisorSnapshot> {
-    rejectLiveMutation();
+    if (isTauri()) {
+      await invoke("complete_codex_goal", { threadId: jobId });
+      return this.loadLiveSnapshot();
+    }
     return this.mutate((snapshot) =>
       completeSupervisorGoal(snapshot, jobId, now),
     );

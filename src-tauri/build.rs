@@ -3,6 +3,8 @@ fn main() {
         tauri_build::AppManifest::new().commands(&[
             "app_info",
             "load_codex_supervisor",
+            "resume_codex_thread",
+            "complete_codex_goal",
             "load_queue",
             "save_queue",
             "run_queue",

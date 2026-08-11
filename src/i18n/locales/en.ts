@@ -118,6 +118,7 @@ export const en = {
         resumed: "Recovery turn started on the existing thread",
         paused: "Job paused",
         goalCompleted: "Goal marked complete",
+        completionCheckStarted: "Goal completion check started",
         actionFailed: "Action failed",
       },
       error: {

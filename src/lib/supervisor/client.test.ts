@@ -120,6 +120,64 @@ describe("supervisorClient in Tauri", () => {
       "read-only",
     );
   });
+
+  it("resumes a live Codex thread through Tauri and reloads the snapshot", async () => {
+    const live = createLiveSnapshot();
+    const refreshed = {
+      ...live,
+      selectedJobId: "live-thread-2",
+      jobs: live.jobs.map((job) =>
+        job.id === "live-thread-2"
+          ? { ...job, status: "resuming" as const }
+          : job,
+      ),
+    };
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "load_codex_supervisor") return refreshed;
+      return undefined;
+    });
+
+    await supervisorClient.load();
+    const result = await supervisorClient.resumeJob("live-thread-2");
+
+    expect(invokeMock.mock.calls).toEqual([
+      ["load_codex_supervisor"],
+      ["resume_codex_thread", { threadId: "live-thread-2" }],
+      ["load_codex_supervisor"],
+    ]);
+    expect(result).toEqual(refreshed);
+  });
+
+  it("completes a live Codex goal through Tauri and reloads the snapshot", async () => {
+    const live = createLiveSnapshot();
+    const refreshed = {
+      ...live,
+      jobs: live.jobs.map((job) =>
+        job.id === "live-thread-1"
+          ? {
+              ...job,
+              status: "completed" as const,
+              goal: { ...job.goal, status: "complete" as const },
+            }
+          : job,
+      ),
+    };
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "load_codex_supervisor") return refreshed;
+      return undefined;
+    });
+
+    await supervisorClient.load();
+    await supervisorClient.selectJob("live-thread-1");
+    const result = await supervisorClient.completeGoal("live-thread-1");
+
+    expect(invokeMock.mock.calls).toEqual([
+      ["load_codex_supervisor"],
+      ["complete_codex_goal", { threadId: "live-thread-1" }],
+      ["load_codex_supervisor"],
+    ]);
+    expect(result).toEqual(refreshed);
+  });
 });
 
 function createLiveSnapshot(): SupervisorSnapshot {
