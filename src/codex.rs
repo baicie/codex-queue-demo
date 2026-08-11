@@ -86,6 +86,7 @@ pub fn codex_thread_writer_available(codex_home: &Path, thread_id: &str) -> Resu
     let file = match OpenOptions::new().read(true).write(true).open(&lock_path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(error) if thread_writer_lock_contended(&error) => return Ok(false),
         Err(error) => {
             return Err(error)
                 .with_context(|| format!("failed to inspect {}", lock_path.display()));
@@ -97,11 +98,21 @@ pub fn codex_thread_writer_available(codex_home: &Path, thread_id: &str) -> Resu
                 .with_context(|| format!("failed to unlock {}", lock_path.display()))?;
             Ok(true)
         }
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
+        Err(error) if thread_writer_lock_contended(&error) => Ok(false),
         Err(error) => {
             Err(error).with_context(|| format!("failed to inspect {}", lock_path.display()))
         }
     }
+}
+
+#[cfg(not(windows))]
+fn thread_writer_lock_contended(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::WouldBlock
+}
+
+#[cfg(windows)]
+fn thread_writer_lock_contended(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::WouldBlock || matches!(error.raw_os_error(), Some(32 | 33))
 }
 
 impl Default for CodexCli {
