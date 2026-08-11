@@ -5,6 +5,13 @@ import { toast } from "sonner";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  Empty,
+  EmptyDescription,
+  EmptyHeader,
+  EmptyMedia,
+  EmptyTitle,
+} from "@/components/ui/empty";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import {
@@ -32,6 +39,7 @@ import {
   CircleDotIcon,
   Clock3Icon,
   CloudOffIcon,
+  InboxIcon,
   ListPlusIcon,
   RadioTowerIcon,
   RefreshCwIcon,
@@ -72,6 +80,35 @@ export function SupervisorDashboard({
     };
   }, [client]);
 
+  useEffect(() => {
+    if (snapshot?.source !== "codex") return;
+
+    let cancelled = false;
+    let refreshing = false;
+    const interval = window.setInterval(() => {
+      if (refreshing) return;
+      refreshing = true;
+      void client
+        .load()
+        .then((nextSnapshot) => {
+          if (!cancelled) {
+            setSnapshot(nextSnapshot);
+            setError(undefined);
+          }
+        })
+        .catch((reason: unknown) => {
+          if (!cancelled) setError(messageFrom(reason));
+        })
+        .finally(() => {
+          refreshing = false;
+        });
+    }, 3_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [client, snapshot?.source]);
+
   const selectedJob = snapshot?.jobs.find(
     (job) => job.id === snapshot.selectedJobId,
   );
@@ -104,7 +141,7 @@ export function SupervisorDashboard({
     }
   }
 
-  if (!snapshot || !selectedJob || !summary) {
+  if (!snapshot || !summary) {
     return error ? (
       <main className="mx-auto flex min-h-[calc(100vh-3.5rem)] max-w-5xl items-center p-4 md:min-h-screen md:p-8">
         <Alert variant="destructive">
@@ -146,8 +183,13 @@ export function SupervisorDashboard({
             onClick={() =>
               void perform(
                 "health",
-                () => client.markProviderHealthy(),
-                "supervisor.toast.providerHealthy",
+                () =>
+                  snapshot.readOnly
+                    ? client.load()
+                    : client.markProviderHealthy(),
+                snapshot.readOnly
+                  ? "supervisor.toast.refreshed"
+                  : "supervisor.toast.providerHealthy",
               )
             }
             disabled={Boolean(busyAction)}
@@ -164,14 +206,15 @@ export function SupervisorDashboard({
       <ProviderBand
         snapshot={snapshot}
         busy={Boolean(busyAction)}
-        outageDisabled={selectedJob.status === "completed"}
-        onOutage={() =>
+        outageDisabled={!selectedJob || selectedJob.status === "completed"}
+        onOutage={() => {
+          if (!selectedJob) return;
           void perform(
             "outage",
             () => client.markProviderDown(selectedJob.id),
             "supervisor.toast.providerDown",
-          )
-        }
+          );
+        }}
         onReset={() =>
           void perform(
             "reset",
@@ -192,79 +235,107 @@ export function SupervisorDashboard({
       <SummaryStrip summary={summary} />
 
       <div className="grid flex-1 gap-5 py-5 lg:grid-cols-[minmax(280px,0.38fr)_minmax(0,0.62fr)] xl:gap-7">
-        <section className="min-w-0" aria-labelledby="supervisor-jobs-heading">
-          <div className="mb-3 flex items-center justify-between gap-3">
-            <h2 id="supervisor-jobs-heading" className="text-sm font-semibold">
-              {t("supervisor.jobs.title")}
-            </h2>
-            <span className="text-xs text-muted-foreground">
-              {t("supervisor.jobs.visible", { count: filteredJobs.length })}
-            </span>
-          </div>
-          <div className="mb-3 overflow-x-auto pb-1">
-            <ToggleGroup
-              type="single"
-              variant="outline"
-              value={filter}
-              onValueChange={(value) => value && setFilter(value as JobFilter)}
-              aria-label={t("supervisor.jobs.filterLabel")}
+        {snapshot.jobs.length === 0 ? (
+          <SupervisorEmptyState />
+        ) : (
+          <>
+            <section
+              className="min-w-0"
+              aria-labelledby="supervisor-jobs-heading"
             >
-              {(["all", "active", "waiting", "completed"] as JobFilter[]).map(
-                (value) => (
-                  <ToggleGroupItem
-                    key={value}
-                    value={value}
-                    aria-label={t(`supervisor.jobs.filter.${value}`)}
-                  >
-                    {t(`supervisor.jobs.filter.${value}`)}
-                  </ToggleGroupItem>
-                ),
-              )}
-            </ToggleGroup>
-          </div>
-          <div className="flex flex-col gap-2">
-            {filteredJobs.map((job) => (
-              <JobListItem
-                key={job.id}
-                job={job}
-                selected={job.id === selectedJob.id}
-                onClick={() => {
-                  setSnapshot((current) =>
-                    current ? { ...current, selectedJobId: job.id } : current,
-                  );
-                  void client.selectJob(job.id);
-                }}
-              />
-            ))}
-          </div>
-        </section>
+              <div className="mb-3 flex items-center justify-between gap-3">
+                <h2
+                  id="supervisor-jobs-heading"
+                  className="text-sm font-semibold"
+                >
+                  {t("supervisor.jobs.title")}
+                </h2>
+                <span className="text-xs text-muted-foreground">
+                  {t("supervisor.jobs.visible", { count: filteredJobs.length })}
+                </span>
+              </div>
+              <div className="mb-3 overflow-x-auto pb-1">
+                <ToggleGroup
+                  type="single"
+                  variant="outline"
+                  value={filter}
+                  onValueChange={(value) =>
+                    value && setFilter(value as JobFilter)
+                  }
+                  aria-label={t("supervisor.jobs.filterLabel")}
+                >
+                  {(
+                    ["all", "active", "waiting", "completed"] as JobFilter[]
+                  ).map((value) => (
+                    <ToggleGroupItem
+                      key={value}
+                      value={value}
+                      aria-label={t(`supervisor.jobs.filter.${value}`)}
+                    >
+                      {t(`supervisor.jobs.filter.${value}`)}
+                    </ToggleGroupItem>
+                  ))}
+                </ToggleGroup>
+              </div>
+              <div className="flex flex-col gap-2">
+                {filteredJobs.map((job) => (
+                  <JobListItem
+                    key={job.id}
+                    job={job}
+                    selected={job.id === selectedJob?.id}
+                    onClick={() => {
+                      setSnapshot((current) =>
+                        current
+                          ? { ...current, selectedJobId: job.id }
+                          : current,
+                      );
+                      void client
+                        .selectJob(job.id)
+                        .catch((reason: unknown) =>
+                          setError(messageFrom(reason)),
+                        );
+                    }}
+                  />
+                ))}
+                {filteredJobs.length === 0 && (
+                  <p className="py-10 text-center text-sm text-muted-foreground">
+                    {t("supervisor.jobs.noMatches")}
+                  </p>
+                )}
+              </div>
+            </section>
 
-        <SupervisorJobDetail
-          job={selectedJob}
-          provider={snapshot.provider}
-          busyAction={busyAction}
-          onResume={() =>
-            void perform(
-              "resume",
-              () => client.resumeJob(selectedJob.id),
-              "supervisor.toast.resumed",
-            )
-          }
-          onPause={() =>
-            void perform(
-              "pause",
-              () => client.pauseJob(selectedJob.id),
-              "supervisor.toast.paused",
-            )
-          }
-          onComplete={() =>
-            void perform(
-              "complete",
-              () => client.completeGoal(selectedJob.id),
-              "supervisor.toast.goalCompleted",
-            )
-          }
-        />
+            {selectedJob && (
+              <SupervisorJobDetail
+                job={selectedJob}
+                provider={snapshot.provider}
+                readOnly={snapshot.readOnly}
+                busyAction={busyAction}
+                onResume={() =>
+                  void perform(
+                    "resume",
+                    () => client.resumeJob(selectedJob.id),
+                    "supervisor.toast.resumed",
+                  )
+                }
+                onPause={() =>
+                  void perform(
+                    "pause",
+                    () => client.pauseJob(selectedJob.id),
+                    "supervisor.toast.paused",
+                  )
+                }
+                onComplete={() =>
+                  void perform(
+                    "complete",
+                    () => client.completeGoal(selectedJob.id),
+                    "supervisor.toast.goalCompleted",
+                  )
+                }
+              />
+            )}
+          </>
+        )}
       </div>
     </main>
   );
@@ -325,34 +396,42 @@ function ProviderBand({
             }).format(new Date(provider.checkedAt)),
           })}
         </span>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              variant="ghost"
-              size="icon-sm"
-              aria-label={t("supervisor.provider.markOutage")}
-              disabled={busy || outageDisabled}
-              onClick={onOutage}
-            >
-              <CloudOffIcon />
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent>{t("supervisor.provider.markOutage")}</TooltipContent>
-        </Tooltip>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              variant="ghost"
-              size="icon-sm"
-              aria-label={t("supervisor.provider.resetDemo")}
-              disabled={busy}
-              onClick={onReset}
-            >
-              <RotateCcwIcon />
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent>{t("supervisor.provider.resetDemo")}</TooltipContent>
-        </Tooltip>
+        {!snapshot.readOnly && (
+          <>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label={t("supervisor.provider.markOutage")}
+                  disabled={busy || outageDisabled}
+                  onClick={onOutage}
+                >
+                  <CloudOffIcon />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>
+                {t("supervisor.provider.markOutage")}
+              </TooltipContent>
+            </Tooltip>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label={t("supervisor.provider.resetDemo")}
+                  disabled={busy}
+                  onClick={onReset}
+                >
+                  <RotateCcwIcon />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>
+                {t("supervisor.provider.resetDemo")}
+              </TooltipContent>
+            </Tooltip>
+          </>
+        )}
       </div>
     </section>
   );
@@ -416,6 +495,21 @@ function SummaryStrip({
         </div>
       ))}
     </section>
+  );
+}
+
+function SupervisorEmptyState() {
+  const { t } = useTranslation();
+  return (
+    <Empty className="min-h-80 rounded-md border lg:col-span-2">
+      <EmptyHeader>
+        <EmptyMedia variant="icon">
+          <InboxIcon aria-hidden="true" />
+        </EmptyMedia>
+        <EmptyTitle>{t("supervisor.empty.title")}</EmptyTitle>
+        <EmptyDescription>{t("supervisor.empty.description")}</EmptyDescription>
+      </EmptyHeader>
+    </Empty>
   );
 }
 

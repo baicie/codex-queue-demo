@@ -1,16 +1,31 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { invoke, isTauri } from "@tauri-apps/api/core";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import {
+  createDemoSupervisor,
+  type SupervisorSnapshot,
+} from "@/domain/supervisor";
 import { supervisorClient } from "@/lib/supervisor/client";
+
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: vi.fn(),
+  isTauri: vi.fn(),
+}));
+
+const invokeMock = vi.mocked(invoke);
+const isTauriMock = vi.mocked(isTauri);
 
 describe("supervisorClient", () => {
   beforeEach(() => {
     localStorage.clear();
+    vi.clearAllMocks();
+    isTauriMock.mockReturnValue(false);
   });
 
   it("seeds a local supervisor and persists provider recovery", async () => {
     const initial = await supervisorClient.load();
     const waiting = await supervisorClient.markProviderDown(
-      initial.selectedJobId,
+      initial.selectedJobId!,
       new Date("2026-08-10T10:00:00.000Z"),
     );
     const reloaded = await supervisorClient.load();
@@ -78,3 +93,49 @@ describe("supervisorClient", () => {
     ).toEqual(migrated);
   });
 });
+
+describe("supervisorClient in Tauri", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    vi.clearAllMocks();
+    isTauriMock.mockReturnValue(true);
+  });
+
+  it("loads live Codex tasks and preserves the selected thread across refreshes", async () => {
+    const live = createLiveSnapshot();
+    invokeMock.mockResolvedValue(live);
+
+    const loaded = await supervisorClient.load();
+    await supervisorClient.selectJob("live-thread-2");
+    const refreshed = await supervisorClient.load();
+
+    expect(invokeMock.mock.calls).toEqual([
+      ["load_codex_supervisor"],
+      ["load_codex_supervisor"],
+    ]);
+    expect(loaded.source).toBe("codex");
+    expect(loaded.readOnly).toBe(true);
+    expect(refreshed.selectedJobId).toBe("live-thread-2");
+    await expect(supervisorClient.pauseJob("live-thread-2")).rejects.toThrow(
+      "read-only",
+    );
+  });
+});
+
+function createLiveSnapshot(): SupervisorSnapshot {
+  const demo = createDemoSupervisor(new Date("2026-08-11T00:00:00.000Z"));
+  const jobs = demo.jobs.slice(0, 2).map((job, index) => ({
+    ...job,
+    id: `live-thread-${index + 1}`,
+    threadId: `live-thread-${index + 1}`,
+    title: `Live task ${index + 1}`,
+    tokensUsed: 1_200 + index,
+  }));
+  return {
+    ...demo,
+    source: "codex",
+    readOnly: true,
+    selectedJobId: jobs[0].id,
+    jobs,
+  };
+}

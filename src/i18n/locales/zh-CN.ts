@@ -47,6 +47,7 @@ export const zhCN = {
         visible: "{{count}} 个",
         filterLabel: "筛选 Job",
         turn: "Turn {{value}}",
+        noMatches: "当前筛选条件下没有任务",
         filter: {
           all: "全部",
           active: "执行中",
@@ -84,7 +85,12 @@ export const zhCN = {
         turns: "Turns",
         attempts: "尝试次数",
         budget: "Token 预算",
+        tokens: "Token 用量",
         updated: "最近更新",
+      },
+      empty: {
+        title: "没有 Codex 任务",
+        description: "Codex Desktop 当前没有可显示的主任务。",
       },
       timeline: {
         title: "恢复时间线",
@@ -106,6 +112,7 @@ export const zhCN = {
       },
       toast: {
         providerHealthy: "Provider 健康检查通过",
+        refreshed: "任务状态已刷新",
         providerDown: "Job 已进入恢复等待",
         demoReset: "演示数据已重置",
         resumed: "已从原 Thread 启动恢复 Turn",

@@ -8,6 +8,7 @@
     "dialog:allow-open",
     "dialog:allow-save",
     "allow-app-info",
+    "allow-load-codex-supervisor",
     "allow-load-queue",
     "allow-save-queue",
     "allow-run-queue",
